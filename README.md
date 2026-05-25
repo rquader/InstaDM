@@ -21,18 +21,21 @@ challenge / internal AJAX) is blocked. Reels and posts in your messages open pro
 ## Requirements
 
 - macOS 14 (Sonoma) or later
-- Xcode 15 or later
 
-## Build & run
+## Install
 
-1. Clone the repo.
-2. Open `InstaDM.xcodeproj` in Xcode.
-3. In **Signing & Capabilities**, set your own Team (or "None" for an
-   unsigned local build). The bundle identifier is
-   `io.github.rquader.instadm`; if you fork this project for your own
-   personal install, point it at your own reverse-DNS namespace.
-4. Build & run (Cmd-R). Log in with your Instagram credentials the first
-   time; the session persists across launches.
+1. Download the latest `InstaDM.app.zip` from the
+   [**Releases page**](https://github.com/rquader/InstaDM/releases).
+2. Unzip it and drag `InstaDM.app` into `/Applications`.
+3. First launch only: right-click the app → **Open** so macOS accepts
+   the unsigned build. Alternatively, run once in Terminal:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/InstaDM.app
+   ```
+
+4. Log in with your Instagram credentials the first time; the session
+   persists across launches.
 
 ## Features
 
@@ -66,17 +69,6 @@ All settings are stored in
 `~/Library/Containers/io.github.rquader.instadm/Data/Library/Preferences/io.github.rquader.instadm.plist`
 on your machine and never leave it.
 
-## Removing optional features in code
-
-Each opt-in surface lives in a single file with a `static let available`
-compile-time flag at the top. Flip to `false` to hide its Settings toggle,
-hide its tab, and lock its URLs unconditionally. Delete the file plus the
-few `grep`-findable call sites for a permanent removal.
-
-- `InstaDM/FollowRequests.swift` — Requests tab + `/accounts/activity/*` access
-- `InstaDM/SharedPosts.swift` — in-app rendering of `/p/*`, `/reel/*`, `/tv/*`
-  when clicked from a DM
-
 ## Caveats
 
 - Instagram's web client is the source of truth. If they redesign URLs or
@@ -91,3 +83,58 @@ Not affiliated with Instagram or Meta. The "Instagram" name is used
 descriptively only. "InstaDM" is also a name which is descriptive to convey what the app is. Use at your own risk. The app may break when Instagram
 changes its web client; users are responsible for compliance with
 Instagram's Terms of Service.
+
+## Acknowledgments
+
+App icon designed in [Canva](https://www.canva.com/) using free
+elements; used under the
+[Canva Free Media License Agreement](https://www.canva.com/policies/free-media-license-agreement/).
+
+---
+
+## For developers
+
+Everything below is for people who want to build from source or
+contribute. End users should use the
+[Releases](https://github.com/rquader/InstaDM/releases) download
+described in **Install** above.
+
+### Build from source
+
+Requirements: macOS 14+ and Xcode 15+.
+
+1. Clone the repo and open `InstaDM.xcodeproj` in Xcode.
+2. In **Signing & Capabilities**, set your own Team (or "None" for an
+   unsigned local build). The bundle identifier is
+   `io.github.rquader.instadm`; if you fork the project for your own
+   personal install, point it at your own reverse-DNS namespace.
+3. Build & run (Cmd-R), or **Product → Archive → Distribute App →
+   Copy App** to produce a standalone `.app` you can drop into
+   `/Applications`.
+
+### Continuous integration
+
+- `.github/workflows/build.yml` runs `swiftc -typecheck` and an
+  unsigned `xcodebuild` of the Debug configuration on every push and
+  pull request to `main`.
+- `.github/workflows/release.yml` triggers on `v*` tags: it does a
+  Release-configuration build on the GitHub-hosted macOS runner, zips
+  the resulting `.app`, and uploads it as the asset of a new GitHub
+  Release. Cut a new release by running:
+
+  ```sh
+  git tag v0.2.0
+  git push origin v0.2.0
+  ```
+
+### Removing optional features in code
+
+Each opt-in non-DM surface lives in a single file with a
+`static let available` compile-time flag at the top. Flip to `false`
+to hide its Settings toggle, hide its tab, and lock its URLs
+unconditionally. Delete the file plus the few `grep`-findable call
+sites for a permanent removal.
+
+- `InstaDM/FollowRequests.swift` — Requests tab + `/accounts/activity/*` access
+- `InstaDM/SharedPosts.swift` — in-app rendering of `/p/*`, `/reel/*`, `/tv/*`
+  when clicked from a DM

@@ -1,0 +1,61 @@
+name: release
+
+# Builds an unsigned Release-configuration .app when a v* tag is pushed,
+# zips it, and uploads it as an asset on a GitHub Release named after
+# the tag. The release body comes from the matching section of
+# CHANGELOG.md (or a generic fallback if none).
+#
+# Trigger one of these by running:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build (Release, unsigned)
+        run: |
+          xcodebuild \
+            -project InstaDM.xcodeproj \
+            -scheme InstaDM \
+            -configuration Release \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Zip the .app
+        run: |
+          APP_PATH="build/Build/Products/Release/InstaDM.app"
+          test -d "$APP_PATH" || (echo "App not found at $APP_PATH" && exit 1)
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" InstaDM.app.zip
+          ls -lh InstaDM.app.zip
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" InstaDM.app.zip \
+            --title "$TAG" \
+            --notes "Unsigned macOS build. First launch: right-click → Open, or run \`xattr -dr com.apple.quarantine /Applications/InstaDM.app\`. See CHANGELOG.md for details."

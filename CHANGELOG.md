@@ -22,13 +22,26 @@ All notable changes to this project are documented here. Dates use
   upstream repo and the maintainer's personal install. Forks should
   retarget to their own namespace.
 
+### Added
+- App icon: a brown speech-bubble mark with three text lines.
+  Generated into the AppIcon.appiconset at all ten Mac sizes
+  (16×16 through 512×512 @1x and @2x) from a single 1024×1024 source.
+- `v0.1.0` GitHub Release with a pre-built unsigned `InstaDM.app.zip`
+  so users without Xcode can drop the app into `/Applications`.
+
+### Removed
+- `LICENSE` and `CONTRIBUTING.md`. The repo is source-available but no
+  rights are explicitly granted at this time; default copyright applies.
+  Not explicitly denying outside contributions either — issues are
+  welcome, PRs will be considered case-by-case.
+
 ### Repo hygiene
 - Removed committed `.DS_Store` and `xcuserdata/` artifacts.
 - `.gitignore` extended to cover `.cursor/` and `.claude/` local
   tool-state folders.
 - Added GitHub Actions CI workflow that typechecks the Swift sources
   and runs an unsigned Debug build on every push.
-- Added `CONTRIBUTING.md` and this `CHANGELOG.md`.
+- Added this `CHANGELOG.md`.
 
 ## 2026-05-16 — Allowed Surfaces Pass
 
