@@ -1,6 +1,6 @@
 # InstaDM
 
-A native macOS app that gives you Instagram **messaging and nothing else** —
+A native macOS app that's meant to give you Instagram **messaging and nothing else** —
 direct messages and group chats, without the feed, reels, explore, or
 stories.
 
@@ -8,12 +8,11 @@ stories.
 
 A small SwiftUI app that embeds Instagram's web client in a `WKWebView` and
 enforces a navigation allowlist: anything outside `/direct/*` (plus login /
-challenge / internal AJAX) is blocked. Links shared in DMs open in your
-default browser.
+challenge / internal AJAX) is blocked. Reels and posts in your messages open properly within the app.
 
 - **Privacy**: everything stays on your Mac. Session cookies live in the
   standard WebKit data store; settings live in `UserDefaults`. No analytics,
-  no telemetry, no third-party SDKs, no cloud sync.
+  no telemetry, no third-party SDKs, no cloud sync. (beyond that done by the Instagram website)
 - **Dependencies**: Apple frameworks only (SwiftUI, WebKit, AppKit,
   UserNotifications, Foundation). No SPM packages, no CocoaPods.
 - **Lifecycle**: standard Mac app. Cmd-Q quits; closing the window quits.
@@ -89,10 +88,6 @@ few `grep`-findable call sites for a permanent removal.
 ## Disclaimer
 
 Not affiliated with Instagram or Meta. The "Instagram" name is used
-descriptively only. Use at your own risk. The app may break when Instagram
+descriptively only. "InstaDM" is also a name which is descriptive to convey what the app is. Use at your own risk. The app may break when Instagram
 changes its web client; users are responsible for compliance with
 Instagram's Terms of Service.
-
-## License
-
-[MIT](./LICENSE).
