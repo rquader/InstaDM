@@ -23,9 +23,13 @@ All notable changes to this project are documented here. Dates use
   retarget to their own namespace.
 
 ### Added
-- App icon: a brown speech-bubble mark with three text lines.
-  Generated into the AppIcon.appiconset at all ten Mac sizes
-  (16×16 through 512×512 @1x and @2x) from a single 1024×1024 source.
+- App icon: a brown speech-bubble mark with three text lines composed
+  in Canva from free content-library elements. Generated into the
+  AppIcon.appiconset at all ten Mac sizes (16×16 through 512×512 @1x
+  and @2x) from a single 1024×1024 source. Underlying elements remain
+  © Canva and their contributors per the
+  [Canva Content License Agreement](https://www.canva.com/policies/content-license-agreement/);
+  see README's Acknowledgments section.
 - `v0.1.0` GitHub Release with a pre-built unsigned `InstaDM.app.zip`
   so users without Xcode can drop the app into `/Applications`.
 

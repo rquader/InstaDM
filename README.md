@@ -86,9 +86,11 @@ Instagram's Terms of Service.
 
 ## Acknowledgments
 
-App icon designed in [Canva](https://www.canva.com/) using free
-elements; used under the
-[Canva Free Media License Agreement](https://www.canva.com/policies/free-media-license-agreement/).
+App icon composed in [Canva](https://www.canva.com/) using free
+elements from Canva's content library. The underlying design elements
+are © Canva and their contributors and are used here under the
+[Canva Content License Agreement](https://www.canva.com/policies/content-license-agreement/);
+they are not claimed as original work of this project.
 
 ---
 
