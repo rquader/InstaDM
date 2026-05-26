@@ -5,6 +5,23 @@ All notable changes to this project are documented here. Dates use
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-05-25
+
+### Fixed
+- Login spinner never completing after entering credentials on macOS 26.
+  Two regressions from the macOS 26 `safeRequest` work and the 2026-05-16
+  silent-cancel path in `handleBlocked`:
+  - When KVC could not read `navigationAction.request`, the delegate
+    cancelled the navigation — that broke login form/AJAX submits and
+    left the Log-in button spinning forever. Unknown URLs now `.allow`
+    instead of `.cancel`.
+  - After a successful login Instagram often 302s through `/` (the feed).
+    `/` is blocked by policy, and the "already on an allowed page → silent
+    cancel" path swallowed that redirect while the web view was still on
+    `/accounts/login/`. Auth pages now bounce to `homeURL` (inbox) when
+    a blocked `/` redirect fires, restoring pre-2026-05-16 behavior for
+    that case only.
+
 ## [1.0.1] - 2026-05-25
 
 ### Fixed
@@ -15,10 +32,9 @@ All notable changes to this project are documented here. Dates use
   very first `decidePolicyForNavigationAction` call. The IUO bridge
   trap (`URLRequest._unconditionallyBridgeFromObjectiveC`) crashed the
   app with `EXC_BREAKPOINT` before any UI rendered. All three call
-  sites in `WebView.Coordinator` now optional-chain through `.request`
-  so a nil bridge falls through to a safe default. macOS 14/15 builds
-  are unaffected by the change (optional-chaining a non-nil IUO is a
-  no-op).
+  sites in `WebView.Coordinator` now read `.request` through KVC
+  (`safeRequest`) so a runtime-nil value does not trap. macOS 14/15
+  builds are unaffected.
 - App version bumped to `1.0.1` so the new release is distinguishable
   from the broken `1.0` build.
 

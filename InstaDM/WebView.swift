@@ -147,6 +147,16 @@ struct WebView: NSViewRepresentable {
         /// finished firing.
         private let bounceCooldown: TimeInterval = 5.0
 
+        /// Set when the user submits credentials; post-login blocked redirects
+        /// are only allowed inside this window so idle prefetch on the login
+        /// page doesn't trigger a premature inbox load.
+        private var authSubmitAt: Date?
+        private let authSubmitWindow: TimeInterval = 120.0
+
+        /// Set when we deliberately allowed a post-login redirect to a blocked
+        /// URL so `didFinish` can route to the inbox once `sessionid` exists.
+        private var awaitingInboxHandoff = false
+
         init(homeURL: URL, tracksNotifications: Bool) {
             self.homeURL = homeURL
             self.tracksNotifications = tracksNotifications
@@ -158,6 +168,18 @@ struct WebView: NSViewRepresentable {
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
             guard let url = navigationAction.safeRequest?.url else {
+                // KVC can return nil during login AJAX on macOS 26. Allow only
+                // in auth context — a global allow lets profile/feed URLs load
+                // and stay in the web view (full Instagram access).
+                if isAuthSource(navigationAction) || isOnAuthSurface(webView) {
+                    authSubmitAt = Date()
+                    decisionHandler(.allow)
+                    return
+                }
+                if isInAuthSubmitWindow() {
+                    decisionHandler(.allow)
+                    return
+                }
                 decisionHandler(.cancel)
                 return
             }
@@ -178,10 +200,35 @@ struct WebView: NSViewRepresentable {
             let sourcePath = navigationAction.sourceFrame.safeRequest?.url?.path ?? ""
             let source = NavigationPolicy.Source(fromDirect: sourcePath.hasPrefix("/direct"))
 
+            if isOnAuthSurface(webView) || isAuthSource(navigationAction) {
+                noteAuthSubmit(navigationAction, url: url)
+            }
+
             if NavigationPolicy.isAllowed(url, source: source) {
                 decisionHandler(.allow)
                 return
             }
+
+            // Blocked link the user tapped inside a DM → Safari, not in-app.
+            if source.fromDirect, navigationAction.navigationType == .linkActivated {
+                NSWorkspace.shared.open(url)
+                decisionHandler(.cancel)
+                return
+            }
+
+            // Post-login 302s target blocked URLs (`/`, etc.). Allow the response
+            // to commit Set-Cookie, then route to inbox in `didFinish` once a
+            // session cookie exists. Use source-frame auth detection — during
+            // redirects `webView.url` is often still nil/stale, which is why
+            // checking only `isOnAuthSurface(webView)` brought the spinner back.
+            if navigationAction.navigationType != .linkActivated,
+               shouldAllowAuthRedirect(webView, navigationAction: navigationAction) {
+                if authSubmitAt == nil { authSubmitAt = Date() }
+                awaitingInboxHandoff = true
+                decisionHandler(.allow)
+                return
+            }
+
             decisionHandler(.cancel)
             handleBlocked(
                 url: url,
@@ -231,6 +278,14 @@ struct WebView: NSViewRepresentable {
             // just because something tried to take us somewhere we won't go.
             if let currentURL = webView.url,
                NavigationPolicy.isAllowed(currentURL) {
+                // Silent-cancel on the login page is what causes the infinite
+                // spinner when a post-login redirect gets blocked. If we're
+                // mid-auth (or just submitted credentials), try routing to the
+                // inbox once session cookies exist — they may already be set on
+                // the login POST even when the follow-up redirect was cancelled.
+                if isOnAuthSurface(webView) || isInAuthSubmitWindow() {
+                    routeToInboxWhenAuthenticated(in: webView)
+                }
                 return
             }
             // Loop guard: a second layer of defense for the case the
@@ -274,6 +329,111 @@ struct WebView: NSViewRepresentable {
         /// suppressed when it shouldn't be.
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             lastBounceAt = nil
+
+            guard let current = webView.url else { return }
+
+            if NavigationPolicy.isAllowed(current) {
+                if !isOnAuthSurface(webView) {
+                    authSubmitAt = nil
+                    awaitingInboxHandoff = false
+                }
+                return
+            }
+
+            // Landed on a blocked surface (profile, feed, explore, …).
+            if awaitingInboxHandoff {
+                awaitingInboxHandoff = false
+                routeToInboxWhenAuthenticated(in: webView)
+                return
+            }
+
+            // Never leave the user browsing full Instagram in-app. A brief
+            // flash may show before we return to the tab's home URL.
+            returnToHome(in: webView)
+        }
+
+        /// Loads `homeURL` when the web view committed to a blocked page.
+        private func returnToHome(in webView: WKWebView) {
+            DispatchQueue.main.async { [homeURL] in
+                guard let url = webView.url, !NavigationPolicy.isAllowed(url) else {
+                    return
+                }
+                webView.load(URLRequest(url: homeURL))
+            }
+        }
+
+        private func noteAuthSubmit(_ navigationAction: WKNavigationAction, url: URL) {
+            if navigationAction.navigationType == .formSubmitted {
+                authSubmitAt = Date()
+                return
+            }
+            if navigationAction.safeRequest?.httpMethod == "POST",
+               (url.path.contains("login") || url.path.contains("/accounts/")) {
+                authSubmitAt = Date()
+            }
+        }
+
+        private func shouldAllowAuthRedirect(
+            _ webView: WKWebView,
+            navigationAction: WKNavigationAction
+        ) -> Bool {
+            // Only true mid-login redirects — not the post-login submit window,
+            // which was incorrectly allowing profile/feed URLs to load then
+            // bounce back via `awaitingInboxHandoff`.
+            if isAuthSource(navigationAction) { return true }
+            if isOnAuthSurface(webView) { return true }
+            return false
+        }
+
+        private func isAuthSource(_ navigationAction: WKNavigationAction) -> Bool {
+            let sourcePath = navigationAction.sourceFrame.safeRequest?.url?.path ?? ""
+            let sourceHost = navigationAction.sourceFrame.safeRequest?.url?.host ?? ""
+            if sourceHost == "accounts.instagram.com" { return true }
+            return sourcePath.hasPrefix("/accounts")
+                || sourcePath.hasPrefix("/challenge")
+        }
+
+        private func isInAuthSubmitWindow() -> Bool {
+            guard let submitAt = authSubmitAt else { return false }
+            return Date().timeIntervalSince(submitAt) < authSubmitWindow
+        }
+
+        /// Loads `homeURL` only after Instagram's `sessionid` cookie is visible.
+        /// Loading the inbox without it produces the empty-login flash.
+        private func routeToInboxWhenAuthenticated(in webView: WKWebView, attempt: Int = 0) {
+            let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+            cookieStore.getAllCookies { [homeURL] cookies in
+                let hasSession = cookies.contains { cookie in
+                    guard cookie.domain.contains("instagram"), !cookie.value.isEmpty else {
+                        return false
+                    }
+                    return cookie.name == "sessionid" || cookie.name == "ds_user_id"
+                }
+                DispatchQueue.main.async {
+                    if hasSession {
+                        self.authSubmitAt = nil
+                        if let current = webView.url,
+                           NavigationPolicy.isAllowed(current),
+                           current.path.hasPrefix("/direct") {
+                            return
+                        }
+                        webView.load(URLRequest(url: homeURL))
+                        return
+                    }
+                    guard attempt < 8 else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        self.routeToInboxWhenAuthenticated(in: webView, attempt: attempt + 1)
+                    }
+                }
+            }
+        }
+
+        /// True when the web view is mid-login or mid-challenge.
+        private func isOnAuthSurface(_ webView: WKWebView) -> Bool {
+            guard let current = webView.url else { return false }
+            if current.host == "accounts.instagram.com" { return true }
+            let path = current.path
+            return path.hasPrefix("/accounts") || path.hasPrefix("/challenge")
         }
     }
 }
@@ -307,7 +467,12 @@ private extension WKNavigationAction {
     /// `request`, read via KVC so a runtime-nil value doesn't trap
     /// the IUO bridge. Use this instead of the direct property.
     var safeRequest: URLRequest? {
-        (self as NSObject).value(forKey: "request") as? URLRequest
+        guard let value = (self as NSObject).value(forKey: "request") else {
+            return nil
+        }
+        if let request = value as? URLRequest { return request }
+        if let nsRequest = value as? NSURLRequest { return nsRequest as URLRequest }
+        return nil
     }
 }
 
@@ -315,6 +480,11 @@ private extension WKFrameInfo {
     /// `request`, read via KVC so a runtime-nil value doesn't trap
     /// the IUO bridge. Use this instead of the direct property.
     var safeRequest: URLRequest? {
-        (self as NSObject).value(forKey: "request") as? URLRequest
+        guard let value = (self as NSObject).value(forKey: "request") else {
+            return nil
+        }
+        if let request = value as? URLRequest { return request }
+        if let nsRequest = value as? NSURLRequest { return nsRequest as URLRequest }
+        return nil
     }
 }
