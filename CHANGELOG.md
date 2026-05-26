@@ -13,13 +13,11 @@ messages only — no feed, reels tab, explore, or stories.
 ### Fixed (login)
 
 - Fresh login looped back to the login form after correct credentials.
-  Blocked navigations during auth were bouncing to `/direct/inbox/` before
-  `sessionid` existed; Instagram immediately sent the user back to login.
-  Mid-auth cancels now stay put; inbox load waits for `sessionid` only.
-- Post-login SPA `pushState` to `/` or `/direct` is rewritten to
-  `location.replace('/direct/inbox/')` on auth/challenge pages.
-- CI release builds are ad-hoc signed with sandbox entitlements (login also
-  failed on the first v1.0.0 zip for that reason).
+  Root cause mix: premature inbox loads before `sessionid` existed, and SPA
+  post-login `pushState` blocked with no Swift handoff. JS now messages Swift
+  instead of `location.replace`; inbox load waits for session cookies; mid-auth
+  cancels no longer bounce to inbox unless credentials were submitted.
+- CI release builds are ad-hoc signed with sandbox entitlements.
 
 ### Highlights
 

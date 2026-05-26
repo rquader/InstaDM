@@ -35,8 +35,13 @@ struct WebView: NSViewRepresentable {
         configuration.websiteDataStore = .default()  // persistent cookies
         configuration.userContentController.addUserScript(Self.spaNavigationGuardJS)
         configuration.userContentController.addUserScript(Self.cosmeticHideNavCSS)
+        configuration.userContentController.add(
+            context.coordinator,
+            name: Self.authHandoffMessageHandler
+        )
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
+        context.coordinator.webView = webView
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = false
@@ -61,7 +66,14 @@ struct WebView: NSViewRepresentable {
         if coordinator.tracksNotifications {
             NotificationManager.shared.detach(forWebView: nsView)
         }
+        nsView.configuration.userContentController.removeScriptMessageHandler(
+            forName: authHandoffMessageHandler
+        )
     }
+
+    /// JS → Swift bridge name for post-login SPA handoff (must match the
+    /// string in `spaNavigationGuardJS`).
+    private static let authHandoffMessageHandler = "instaDMAuthHandoff"
 
     // MARK: - SPA navigation guard
 
@@ -102,10 +114,11 @@ struct WebView: NSViewRepresentable {
     /// is exactly the leak this app exists to prevent.
     ///
     /// Post-login handoff: Instagram often `pushState`s to `/` or `/direct`
-    /// after credentials commit. Those paths are blocked for DM sessions but
-    /// must not trap a fresh login — when the current page is auth/challenge,
-    /// rewrite that SPA hop into a real navigation to `/direct/inbox/`.
+    /// after credentials commit. Block those (feed/minimize shell) but ping
+    /// Swift via `webkit.messageHandlers` so it can wait for `sessionid`
+    /// before loading `/direct/inbox/` — never `location.replace` early.
     private static let spaNavigationGuardJS: WKUserScript = {
+        let handoffHandler = authHandoffMessageHandler
         let source = """
         (function() {
             if (window.__InstaDMNavGuard) { return; }
@@ -201,12 +214,11 @@ struct WebView: NSViewRepresentable {
                         var path = resolvePath(url);
                         if (path !== null && !pathAllowed(path)) {
                             var current = location.pathname || '/';
-                            if (isAuthPath(current)) {
-                                var handoff = authHandoffTarget(path);
-                                if (handoff !== null) {
-                                    location.replace(handoff);
-                                    return undefined;
-                                }
+                            if (isAuthPath(current) && authHandoffTarget(path) !== null) {
+                                try {
+                                    window.webkit.messageHandlers.\(handoffHandler).postMessage('postLogin');
+                                } catch (e) { /* no handler yet */ }
+                                return undefined;
                             }
                             return undefined;
                         }
@@ -336,7 +348,9 @@ struct WebView: NSViewRepresentable {
 
     // MARK: - Coordinator
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+
+        weak var webView: WKWebView?
 
         /// The URL this coordinator rebounds blocked JS-driven navigations
         /// to. For Messages it's the inbox; for Requests it's the follow-
@@ -563,8 +577,7 @@ struct WebView: NSViewRepresentable {
 
             if awaitingInboxHandoff {
                 let path = url.path
-                if path.isEmpty || path == "/"
-                    || NavigationPolicy.isDirectMessagingPath(path) {
+                if path.isEmpty || path == "/" {
                     decisionHandler(.allow)
                     return
                 }
@@ -645,6 +658,11 @@ struct WebView: NSViewRepresentable {
             if let currentURL = webView.url,
                NavigationPolicy.isAllowed(currentURL),
                NavigationPolicy.isInAppUserSurface(currentURL.path) {
+                // Only after the user actually submitted credentials — not on
+                // every blocked prefetch while the login form is idle.
+                if isOnAuthSurface(webView), authSubmitAt != nil {
+                    routeToInboxWhenAuthenticated(in: webView)
+                }
                 return
             }
             if webView.url == nil {
@@ -880,6 +898,14 @@ struct WebView: NSViewRepresentable {
                 "wv=\(current.absoluteString) onAuth=\(isOnAuthSurface(webView)) settled=\(hasSettledOnUserSurface) needsHeal=\(surfaceNeedsHeal) restoring=\(isRestoringDMSurface) lastDMSurface=\(lastDMSurfaceURL?.absoluteString ?? "nil")"
             )
 
+            // AJAX login often keeps the auth URL while Set-Cookie lands — poll
+            // for session cookies after submit even if no redirect/pushState fired.
+            if isOnAuthSurface(webView), authSubmitAt != nil {
+                routeToInboxWhenAuthenticated(in: webView)
+                lastCommittedPath = current.path
+                return
+            }
+
             if NavigationPolicy.isAllowed(current) {
                 let path = current.path
                 let fromDirect = NavigationPolicy.isDirectMessagingPath(path)
@@ -907,8 +933,14 @@ struct WebView: NSViewRepresentable {
                 }
 
                 if !isOnAuthSurface(webView) {
-                    authSubmitAt = nil
                     awaitingInboxHandoff = false
+                    if NavigationPolicy.isDirectMessagingPath(path),
+                       !hasSettledOnUserSurface {
+                        routeToInboxWhenAuthenticated(in: webView)
+                        lastCommittedPath = path
+                        return
+                    }
+                    authSubmitAt = nil
                     markSettledOnUserSurface(from: current)
                 }
                 lastCommittedPath = path
@@ -999,9 +1031,21 @@ struct WebView: NSViewRepresentable {
                 return false
             }
             let path = url.path
-            // Post-login redirect — feed root or straight into DMs.
+            // Post-login 302 through feed root only — inbox load waits for cookies.
             return path.isEmpty || path == "/"
-                || NavigationPolicy.isDirectMessagingPath(path)
+        }
+
+        // MARK: - JS auth handoff
+
+        func userContentController(
+            _ userContentController: WKUserContentController,
+            didReceive message: WKScriptMessage
+        ) {
+            guard message.name == WebView.authHandoffMessageHandler else { return }
+            authSubmitAt = authSubmitAt ?? Date()
+            awaitingInboxHandoff = true
+            guard let webView else { return }
+            routeToInboxWhenAuthenticated(in: webView)
         }
 
         /// True when the user is viewing DMs — uses source frame **or** the
@@ -1034,25 +1078,25 @@ struct WebView: NSViewRepresentable {
             let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
             cookieStore.getAllCookies { [homeURL] cookies in
                 let hasSession = cookies.contains { cookie in
-                    cookie.domain.contains("instagram")
-                        && cookie.name == "sessionid"
-                        && !cookie.value.isEmpty
+                    guard cookie.domain.contains("instagram"), !cookie.value.isEmpty else {
+                        return false
+                    }
+                    return cookie.name == "sessionid" || cookie.name == "ds_user_id"
                 }
                 DispatchQueue.main.async {
                     if hasSession {
                         self.authSubmitAt = nil
+                        self.awaitingInboxHandoff = false
                         if let current = webView.url,
                            NavigationPolicy.isAllowed(current),
                            NavigationPolicy.isDirectMessagingPath(current.path) {
-                            self.awaitingInboxHandoff = false
                             self.markSettledOnUserSurface(from: current)
                             return
                         }
-                        self.awaitingInboxHandoff = false
                         webView.load(URLRequest(url: homeURL))
                         return
                     }
-                    guard attempt < 24 else { return }
+                    guard attempt < 30 else { return }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                         self.routeToInboxWhenAuthenticated(in: webView, attempt: attempt + 1)
                     }
