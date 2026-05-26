@@ -44,6 +44,23 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             build
 
+      - name: Ad-hoc sign with entitlements
+        run: |
+          APP_PATH="build/Build/Products/Release/InstaDM.app"
+          test -d "$APP_PATH" || (echo "App not found at $APP_PATH" && exit 1)
+          # xcodebuild with CODE_SIGNING_ALLOWED=NO leaves a linker-adhoc
+          # binary with no embedded entitlements. Local Xcode "Run" signs
+          # automatically, which is why login worked locally but not from
+          # the GitHub zip. Re-sign ad-hoc so sandbox + network.client
+          # match a normal dev build.
+          codesign --force --deep --sign - \
+            --identifier io.github.rquader.instadm \
+            --entitlements InstaDM/InstaDM.entitlements \
+            --options runtime \
+            "$APP_PATH"
+          codesign --verify --deep --strict "$APP_PATH"
+          codesign -dv --entitlements :- "$APP_PATH"
+
       - name: Zip the .app
         run: |
           APP_PATH="build/Build/Products/Release/InstaDM.app"
