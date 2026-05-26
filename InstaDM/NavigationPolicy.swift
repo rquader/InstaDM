@@ -70,6 +70,30 @@ enum NavigationPolicy {
         "/static",
     ]
 
+    // MARK: - JS guard allowlists (per-tab scope)
+
+    /// Path prefixes that the document-start JS guard in
+    /// `WebView.spaNavigationGuardScript` permits **regardless of which
+    /// tab hosts the web view** — auth, challenge, and internal XHR
+    /// endpoints. Without these, the page can't authenticate or fire its
+    /// own AJAX. Tabs add their feature-specific prefixes on top.
+    static let jsCommonAllowedPathPrefixes: [String] =
+        authAccountPathPrefixes + alwaysAllowedPathPrefixes
+
+    /// JS-guard allowlist for the Messages tab — direct-messaging surfaces.
+    ///
+    /// Mirrors `isDirectMessagingPath`. If you add a DM subpath here,
+    /// extend `isDirectMessagingPath` to match (and vice versa) or the
+    /// click-layer JS guard will fall out of sync with the URL-layer
+    /// Swift policy: anchor clicks to the new surface would be blocked
+    /// at the capture phase even though `decidePolicyFor` would allow
+    /// them, and the new surface would simply do nothing in the UI.
+    static let jsMessagesTabAllowedPathPrefixes: [String] = [
+        "/direct/inbox",
+        "/direct/t/",
+        "/direct/new",
+    ]
+
     // MARK: - Source context
 
     /// Information about where a navigation originated. Used to permit

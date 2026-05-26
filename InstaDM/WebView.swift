@@ -200,22 +200,74 @@ struct WebView: NSViewRepresentable {
 
     // MARK: - Cosmetic CSS
 
-    /// Hides Instagram's left-rail Home / Explore / Reels links so the user
-    /// isn't visually tempted toward surfaces this app exists to block.
+    /// Hides Instagram's left-rail items that lead off the DM surface so
+    /// the user isn't visually tempted toward surfaces the JS guard / URL
+    /// policy block anyway. Removing the temptation is the *only* job of
+    /// this CSS — it is not a security layer.
     ///
-    /// The real defense is `NavigationPolicy` — these selectors *will* drift
-    /// when Instagram re-shuffles class names, and it's fine when they do.
-    /// The user will see a "Home" link until selectors are updated; clicking
-    /// it still gets blocked.
+    /// Selectors are a mix of:
+    ///   - **`href` patterns** (stable across class-name churn, language-
+    ///     independent), and
+    ///   - **`aria-label` patterns** qualified to interactive elements
+    ///     (`a`, `button`, `[role=link|button]`) so the messenger's own
+    ///     `<input>` search field isn't caught. Aria labels rely on the
+    ///     English locale; if a user switches Instagram's language, the
+    ///     rail will partially reappear. JS guard + URL policy keep them
+    ///     unclickable regardless.
+    ///
+    /// Expected drift: Instagram reshuffles its DOM every few months.
+    /// Cosmetic regressions show up as visible rail items; check the live
+    /// site in Safari DevTools and add the new selector here. The
+    /// navigation allowlist is the actual defense.
     private static let cosmeticHideNavCSS: WKUserScript = {
         let css = """
+        /* Anchor targets — language-independent */
         a[href='/']:not([href*='direct']),
         a[href^='/explore/'],
+        a[href^='/explore'],
         a[href^='/reels/'],
+        a[href^='/reels'],
         a[href*='notifications'],
         a[href^='/accounts/activity'],
         a[href^='/accounts/edit/'],
-        a[href^='/accounts/manage'] { display: none !important; }
+        a[href^='/accounts/manage'],
+        a[href^='/accounts/password'],
+        a[href^='/your_activity'],
+        a[href^='/saved/'],
+        a[href*='/create/'],
+        a[href*='threads.net'],
+        a[href*='threads.com'],
+
+        /* Aria-labelled rail controls (English locale).
+           Qualified to interactive non-input elements so the messenger's
+           own Search input/textarea is not caught. */
+        a[aria-label='Search'],
+        button[aria-label='Search'],
+        [role='link'][aria-label='Search'],
+        [role='button'][aria-label='Search'],
+        a[aria-label='Home'],
+        button[aria-label='Home'],
+        [role='link'][aria-label='Home'],
+        a[aria-label='Explore'],
+        button[aria-label='Explore'],
+        [role='link'][aria-label='Explore'],
+        a[aria-label='Reels'],
+        button[aria-label='Reels'],
+        [role='link'][aria-label='Reels'],
+        a[aria-label='Notifications'],
+        button[aria-label='Notifications'],
+        [role='link'][aria-label='Notifications'],
+        button[aria-label='New post'],
+        [role='button'][aria-label='New post'],
+        button[aria-label='Create'],
+        [role='button'][aria-label='Create'],
+        button[aria-label='More'],
+        [role='button'][aria-label='More'],
+        a[aria-label='Threads'],
+        button[aria-label='Threads'],
+        [role='link'][aria-label='Threads'] {
+            display: none !important;
+        }
         """
         // JSON-encode the CSS into a JS string literal so a future backtick
         // or `$` in the CSS can't break the surrounding template.

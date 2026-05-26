@@ -1,108 +1,119 @@
 import SwiftUI
 
-/// The Cmd-, preferences pane. Two `Section`s — Appearance and Notifications
-/// — plus a quiet footer reminding the user that no data leaves the device.
+/// The Cmd-, preferences pane.
 ///
-/// Reads/writes settings through `@AppStorage` against the keys in
-/// `SettingsKey`; the same keys are read by `NotificationManager` via the
-/// static `AppSettings` interface, so the two paths can't drift.
+/// macOS-native `Form` with `.formStyle(.grouped)` so each section renders
+/// as a rounded card that picks up the system's light/dark appearance and
+/// gets proper text contrast for free. No custom backgrounds — the OS does
+/// a better job here than a hand-painted palette.
+///
+/// Reads/writes through `@AppStorage` against `SettingsKey`. `AppSettings`
+/// reads the same keys for non-view code so the two paths can't drift.
 struct SettingsView: View {
 
-    // Notifications
     @AppStorage(SettingsKey.notificationLevel) private var levelRaw    = NotificationLevel.standard.rawValue
     @AppStorage(SettingsKey.notificationSound) private var sound       = true
     @AppStorage(SettingsKey.pollingInterval)   private var intervalRaw = PollingInterval.normal.rawValue
+    @AppStorage(SettingsKey.colorSchemePref)   private var schemePrefRaw = ColorSchemePreference.system.rawValue
 
-    // Appearance
-    @AppStorage(SettingsKey.themeID)         private var themeIDRaw    = ThemeID.sage.rawValue
-    @AppStorage(SettingsKey.colorSchemePref) private var schemePrefRaw = ColorSchemePreference.system.rawValue
-
-    // Allowed surfaces (opt-in per feature module)
-    @AppStorage(SettingsKey.allowFollowRequests) private var allowFollowRequests = FollowRequests.defaultEnabled
-    @AppStorage(SettingsKey.allowSharedPosts)    private var allowSharedPosts    = SharedPosts.defaultEnabled
     @AppStorage(SettingsKey.openLinksInExternalBrowser)
     private var openLinksInExternalBrowser = true
 
-    @Environment(\.theme) private var theme
+    @AppStorage(SettingsKey.allowFollowRequests)
+    private var allowFollowRequests = FollowRequests.defaultEnabled
+
+    @AppStorage(SettingsKey.allowSharedPosts)
+    private var allowSharedPosts = SharedPosts.defaultEnabled
 
     var body: some View {
         Form {
-            appearanceSection
-            linksSection
-            allowedSurfacesSection
             notificationsSection
+            linksSection
+            appearanceSection
+            allowedSurfacesSection
             footerSection
         }
-        // `Form` on macOS paints its own material background by default;
-        // hiding the scroll-content background lets `theme.background` show
-        // through and the form actually picks up the active palette.
-        .scrollContentBackground(.hidden)
-        .padding()
-        .frame(width: 480, height: 520)
-        .background(theme.background)
-        .foregroundStyle(theme.text)
+        .formStyle(.grouped)
+        .frame(width: 520, height: 560)
     }
 
     // MARK: - Sections
 
+    /// How aggressively to notify on new DMs, plus the polling cadence that
+    /// drives detection. Sound is only shown when banners actually fire.
+    private var notificationsSection: some View {
+        Section {
+            Picker("Notify me about new messages", selection: levelBinding) {
+                Text("Off").tag(NotificationLevel.off)
+                Text("Dock badge only").tag(NotificationLevel.badgeOnly)
+                Text("Banner alert").tag(NotificationLevel.standard)
+            }
+
+            if currentLevel.wantsBanners {
+                Toggle("Play sound when a banner fires", isOn: $sound)
+            }
+
+            Picker("Check Instagram every", selection: intervalBinding) {
+                Text("15 seconds").tag(PollingInterval.fast)
+                Text("30 seconds").tag(PollingInterval.normal)
+                Text("1 minute").tag(PollingInterval.slow)
+                Text("2 minutes").tag(PollingInterval.slower)
+            }
+            .disabled(currentLevel == .off)
+
+            Text(
+                "InstaDM polls Instagram’s tab title (e.g. \u{201C}(3) Inbox • Instagram\u{201D}) to detect new "
+                + "unread messages and update the dock badge. A faster interval notifies you sooner; "
+                + "a slower interval uses slightly less battery."
+            )
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        } header: {
+            Text("Notifications")
+        }
+    }
+
+    /// External-browser routing for blocked link taps.
+    private var linksSection: some View {
+        Section {
+            Toggle("Open links in default browser", isOn: $openLinksInExternalBrowser)
+
+            Text(
+                "When on, profile taps and shared links open in Safari (or your default browser) "
+                + "instead of staying in-app. Turn it off to keep everything in InstaDM — blocked "
+                + "links cancel silently. Login and account-recovery flows may still use your "
+                + "browser when Instagram requires it."
+            )
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        } header: {
+            Text("Links")
+        }
+    }
+
+    /// Light / Dark / System override. Theme palette is fixed (Sage).
     private var appearanceSection: some View {
         Section {
-            Picker("Theme", selection: themeBinding) {
-                ForEach(ThemeID.allCases) { theme in
-                    Text(theme.displayName).tag(theme)
-                }
-            }
-            .pickerStyle(.segmented)
-
             Picker("Color scheme", selection: schemeBinding) {
                 ForEach(ColorSchemePreference.allCases) { pref in
                     Text(pref.displayName).tag(pref)
                 }
             }
-        } header: {
-            Text("Appearance").foregroundStyle(theme.textSecondary)
-        }
-    }
 
-    private var linksSection: some View {
-        Section {
-            Toggle("Open links in default browser", isOn: $openLinksInExternalBrowser)
             Text(
-                "After you’re logged in, profile taps and shared links can open in Safari (or your default browser). " +
-                "Turn this off to keep everything in the app — blocked links are cancelled and overlays dismissed instead. " +
-                "Login and account recovery may still use your browser when needed."
+                "Affects InstaDM’s own surfaces (this window, the tab bar). Instagram’s web view "
+                + "follows its own theme — InstaDM doesn’t restyle it."
             )
             .font(.footnote)
-            .foregroundStyle(theme.textSecondary)
+            .foregroundStyle(.secondary)
         } header: {
-            Text("Links").foregroundStyle(theme.textSecondary)
+            Text("Appearance")
         }
     }
 
-    private var notificationsSection: some View {
-        Section {
-            Picker("Level", selection: levelBinding) {
-                ForEach(NotificationLevel.allCases, id: \.self) { level in
-                    Text(level.displayName).tag(level)
-                }
-            }
-            Toggle("Play sound", isOn: $sound)
-                .disabled(!currentLevel.wantsBanners)
-            Picker("Check every", selection: intervalBinding) {
-                ForEach(PollingInterval.allCases, id: \.self) { interval in
-                    Text(interval.displayName).tag(interval)
-                }
-            }
-            .disabled(currentLevel == .off)
-        } header: {
-            Text("Notifications").foregroundStyle(theme.textSecondary)
-        }
-    }
-
-    /// Opt-in non-DM surfaces. Each toggle is gated by its feature module's
-    /// compile-time `available` flag — flipping that flag to `false` (or
-    /// deleting the feature file) makes the toggle disappear without
-    /// touching anything else here.
+    /// Opt-in non-DM surfaces. Each toggle is gated on its feature module's
+    /// compile-time `available` flag, so deleting a feature also removes its
+    /// setting without touching this view.
     @ViewBuilder
     private var allowedSurfacesSection: some View {
         if FollowRequests.available || SharedPosts.available {
@@ -113,21 +124,27 @@ struct SettingsView: View {
                 if SharedPosts.available {
                     Toggle(SharedPosts.displayName, isOn: $allowSharedPosts)
                 }
-                Text("Each toggle opens a non-DM Instagram surface. Off by default; the more you turn on, the larger the area the app exposes.")
-                    .font(.footnote)
-                    .foregroundStyle(theme.textSecondary)
+                Text(
+                    "Each toggle exposes a non-DM Instagram surface. Off by default; the more you "
+                    + "turn on, the larger the area the app reaches."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
             } header: {
-                Text("Allowed Surfaces").foregroundStyle(theme.textSecondary)
+                Text("Allowed surfaces")
             }
         }
     }
 
     private var footerSection: some View {
         Section {
-            Text("All settings are stored locally on this Mac. Nothing is sent anywhere except Instagram itself.")
-                .font(.footnote)
-                .italic()
-                .foregroundStyle(theme.textSecondary)
+            Text(
+                "All settings are stored locally on this Mac. Nothing is sent anywhere except "
+                + "Instagram itself."
+            )
+            .font(.footnote)
+            .italic()
+            .foregroundStyle(.secondary)
         }
     }
 
@@ -150,13 +167,6 @@ struct SettingsView: View {
         Binding(
             get: { PollingInterval(rawValue: intervalRaw) ?? .normal },
             set: { intervalRaw = $0.rawValue }
-        )
-    }
-
-    private var themeBinding: Binding<ThemeID> {
-        Binding(
-            get: { ThemeID(rawValue: themeIDRaw) ?? .sage },
-            set: { themeIDRaw = $0.rawValue }
         )
     }
 

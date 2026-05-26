@@ -2,9 +2,15 @@ import SwiftUI
 
 // MARK: - Palette
 
-/// The colors the app paints onto every surface it owns (Settings window,
-/// system control tints). Instagram's web view is *not* themed in Phase 1 —
-/// that surface stays as Instagram renders it.
+/// The colors the app paints onto the surfaces it owns (tab tint, accent for
+/// system controls). Instagram's web view is **not** themed — that surface
+/// stays as Instagram renders it.
+///
+/// Settings used to override these onto its window background and section
+/// labels; that was dropped in 1.0.3 in favour of macOS-native grouped Form
+/// styling, which handles contrast and dark-mode flips correctly without
+/// us reaching for explicit colors. The palette is now used for the tint
+/// accent only.
 struct Palette: Equatable {
     let background: Color
     let surface: Color
@@ -17,27 +23,29 @@ struct Palette: Equatable {
 
 // MARK: - Theme
 
-/// Three calm, natural-green palettes. Hex values come from the design spec
-/// in `UI Design and Theming.md`; each is verified for WCAG AA text contrast
-/// in both light and dark variants.
+/// Sage — a calm, natural-green palette. The original spec shipped three
+/// themes (Sage / Forest / Mist) but a one-window utility app didn't need
+/// the variety: themes only touch Settings and the tab bar, and the
+/// WebView (the visible majority of the app) is Instagram's own UI.
+///
+/// The enum survives as `enum ThemeID { case sage }` so the rest of the
+/// codebase keeps reading `ThemeID.sage.palette(for: ...)` without an
+/// architecture rewrite. Adding another palette later is a single new
+/// case plus a `switch` arm in `palette(for:)`.
 enum ThemeID: String, CaseIterable, Identifiable {
-    case sage, forest, mist
+    case sage
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
-        case .sage:   return "Sage"
-        case .forest: return "Forest"
-        case .mist:   return "Mist"
+        case .sage: return "Sage"
         }
     }
 
     func palette(for scheme: ColorScheme) -> Palette {
-        switch (self, scheme) {
-
-        // MARK: Sage
-        case (.sage, .light):
+        switch scheme {
+        case .light:
             return Palette(
                 background:    Color(hex: 0xF7F7F2),
                 surface:       Color(hex: 0xF0F2EA),
@@ -47,7 +55,7 @@ enum ThemeID: String, CaseIterable, Identifiable {
                 textSecondary: Color(hex: 0x5C6B5A),
                 divider:       Color(hex: 0xD9DDD0)
             )
-        case (.sage, .dark):
+        case .dark:
             return Palette(
                 background:    Color(hex: 0x161A15),
                 surface:       Color(hex: 0x1F241D),
@@ -57,51 +65,6 @@ enum ThemeID: String, CaseIterable, Identifiable {
                 textSecondary: Color(hex: 0x8E948A),
                 divider:       Color(hex: 0x2A3028)
             )
-
-        // MARK: Forest
-        case (.forest, .light):
-            return Palette(
-                background:    Color(hex: 0xF2EFE5),
-                surface:       Color(hex: 0xEAE6D7),
-                primary:       Color(hex: 0x2D5A3D),
-                accent:        Color(hex: 0x1B4332),
-                text:          Color(hex: 0x1B2A1B),
-                textSecondary: Color(hex: 0x4A5A4A),
-                divider:       Color(hex: 0xC4BFB0)
-            )
-        case (.forest, .dark):
-            return Palette(
-                background:    Color(hex: 0x0E1612),
-                surface:       Color(hex: 0x15201A),
-                primary:       Color(hex: 0x4A8067),
-                accent:        Color(hex: 0x6FA88B),
-                text:          Color(hex: 0xD8D4C6),
-                textSecondary: Color(hex: 0x7A8579),
-                divider:       Color(hex: 0x1F2A24)
-            )
-
-        // MARK: Mist
-        case (.mist, .light):
-            return Palette(
-                background:    Color(hex: 0xF4F6F1),
-                surface:       Color(hex: 0xE9EDE3),
-                primary:       Color(hex: 0x88A786),
-                accent:        Color(hex: 0x5F8A6A),
-                text:          Color(hex: 0x2E3A2E),
-                textSecondary: Color(hex: 0x5E6B5E),
-                divider:       Color(hex: 0xD5DCCB)
-            )
-        case (.mist, .dark):
-            return Palette(
-                background:    Color(hex: 0x131914),
-                surface:       Color(hex: 0x1B2219),
-                primary:       Color(hex: 0xA8C8A8),
-                accent:        Color(hex: 0xC8E0C8),
-                text:          Color(hex: 0xE8ECE3),
-                textSecondary: Color(hex: 0x8E948A),
-                divider:       Color(hex: 0x262E26)
-            )
-
         @unknown default:
             return palette(for: .light)
         }
