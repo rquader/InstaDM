@@ -37,36 +37,28 @@ enum NavigationPolicy {
         "accounts.instagram.com",
     ]
 
+    /// Auth account subpaths only — not a blanket `/accounts` prefix.
+    private static let authAccountPathPrefixes: [String] = [
+        "/accounts/login",
+        "/accounts/onetap",
+        "/accounts/password",
+        "/accounts/signup",
+        "/accounts/emailsignup",
+        "/accounts/check_email",
+        "/accounts/logout",
+        "/accounts/confirm",
+        "/accounts/access",
+        "/accounts/account_recovery",
+        "/accounts/username",
+    ]
+
     /// Path prefixes on `*.instagram.com` that the app always permits,
     /// regardless of feature toggles.
     ///
     /// `/accounts/*` is **deliberately narrowed** to specific auth
-    /// subpaths. A blanket `/accounts` would silently let in
-    /// `/accounts/activity` (follow requests), `/accounts/edit`,
-    /// `/accounts/notifications`, etc. — surfaces this app exists to hide.
+    /// subpaths via `authAccountPathPrefixes`. A blanket `/accounts` would
+    /// silently let in `/accounts/activity`, `/accounts/notifications`, etc.
     private static let alwaysAllowedPathPrefixes: [String] = [
-        // Messaging — covers 1:1 DMs, group chats, and `/direct/new` compose.
-        "/direct",
-
-        // Auth surfaces. **Broadened to the entire `/accounts` tree** after
-        // the narrowed list (login/onetap/password/signup/emailsignup/
-        // check_email/logout) broke the login loop in practice on 2026-05-16
-        // — Instagram's post-login redirect hits something else under
-        // `/accounts/*` we hadn't enumerated, and our bounce-to-inbox sends
-        // the user right back to login.
-        //
-        // Trade-off: this lets `/accounts/edit`, `/accounts/notifications`,
-        // `/accounts/manage_access` etc. through if Instagram chrome links
-        // to them. The Follow-Requests feature module still gates its tab
-        // separately, so it remains "off by default" in the UI sense, but
-        // the URL itself is now reachable if the user finds a link to it.
-        //
-        // To re-narrow safely later: log blocked URLs (add NSLog in the
-        // navigation delegate), capture the real post-login redirect chain,
-        // and enumerate the missing subpath. See [[Risks and Failure Modes]]
-        // § "Highest-risk drift point" for the diagnostic recipe.
-        "/accounts",
-
         // Security checkpoints (e.g. "we noticed an unusual login").
         "/challenge",
 
@@ -111,7 +103,15 @@ enum NavigationPolicy {
         // and reroutes to the tab's home URL.
         if path.isEmpty || path == "/" { return false }
 
-        // Base allowlist — messaging, auth, internal endpoints.
+        if isDirectMessagingPath(path) {
+            return true
+        }
+
+        if pathMatches(path, anyOf: authAccountPathPrefixes) {
+            return true
+        }
+
+        // Base allowlist — challenge + internal endpoints.
         if pathMatches(path, anyOf: alwaysAllowedPathPrefixes) {
             return true
         }
@@ -130,6 +130,35 @@ enum NavigationPolicy {
             return true
         }
 
+        return false
+    }
+
+    /// User-facing surfaces the web view should stay on after login.
+    /// Auth paths and internal XHR endpoints are allowed for loading but
+    /// should not persist as the main document.
+    static func isInAppUserSurface(_ path: String, source: Source = .none) -> Bool {
+        if isDirectMessagingPath(path) { return true }
+        if pathMatches(path, anyOf: authAccountPathPrefixes) { return true }
+        if pathMatches(path, anyOf: ["/challenge"]) { return true }
+        if FollowRequests.enabled,
+           pathMatches(path, anyOf: FollowRequests.allowedPathPrefixes) {
+            return true
+        }
+        if SharedPosts.enabled, source.fromDirect,
+           pathMatches(path, anyOf: SharedPosts.allowedPathPrefixes) {
+            return true
+        }
+        return false
+    }
+
+    /// DM surfaces the app intentionally exposes — not every `/direct/…` path.
+    /// Group-chat sender links can route to other `/direct/…` URLs that render
+    /// full Instagram; those must stay blocked.
+    static func isDirectMessagingPath(_ path: String) -> Bool {
+        if path == "/direct" { return true }
+        if path.hasPrefix("/direct/inbox") { return true }
+        if path.hasPrefix("/direct/t/") { return true }
+        if path.hasPrefix("/direct/new") { return true }
         return false
     }
 

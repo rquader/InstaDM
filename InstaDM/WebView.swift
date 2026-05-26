@@ -75,7 +75,11 @@ struct WebView: NSViewRepresentable {
         let css = """
         a[href='/']:not([href*='direct']),
         a[href^='/explore/'],
-        a[href^='/reels/'] { display: none !important; }
+        a[href^='/reels/'],
+        a[href*='notifications'],
+        a[href^='/accounts/activity'],
+        a[href^='/accounts/edit/'],
+        a[href^='/accounts/manage'] { display: none !important; }
         """
         // JSON-encode the CSS into a JS string literal so a future backtick
         // or `$` in the CSS can't break the surrounding template.
@@ -151,7 +155,6 @@ struct WebView: NSViewRepresentable {
         /// are only allowed inside this window so idle prefetch on the login
         /// page doesn't trigger a premature inbox load.
         private var authSubmitAt: Date?
-        private let authSubmitWindow: TimeInterval = 120.0
 
         /// Set when we deliberately allowed a post-login redirect to a blocked
         /// URL so `didFinish` can route to the inbox once `sessionid` exists.
@@ -176,10 +179,6 @@ struct WebView: NSViewRepresentable {
                     decisionHandler(.allow)
                     return
                 }
-                if isInAuthSubmitWindow() {
-                    decisionHandler(.allow)
-                    return
-                }
                 decisionHandler(.cancel)
                 return
             }
@@ -198,19 +197,31 @@ struct WebView: NSViewRepresentable {
             // source frame request falls back to "not from a DM" —
             // strictest interpretation, safe.
             let sourcePath = navigationAction.sourceFrame.safeRequest?.url?.path ?? ""
-            let source = NavigationPolicy.Source(fromDirect: sourcePath.hasPrefix("/direct"))
+            let source = NavigationPolicy.Source(
+                fromDirect: NavigationPolicy.isDirectMessagingPath(sourcePath)
+            )
 
             if isOnAuthSurface(webView) || isAuthSource(navigationAction) {
                 noteAuthSubmit(navigationAction, url: url)
             }
 
             if NavigationPolicy.isAllowed(url, source: source) {
+                if !isOnAuthSurface(webView),
+                   !isAuthSource(navigationAction),
+                   !NavigationPolicy.isInAppUserSurface(url.path, source: source) {
+                    decisionHandler(.cancel)
+                    webView.stopLoading()
+                    return
+                }
                 decisionHandler(.allow)
                 return
             }
 
-            // Blocked link the user tapped inside a DM → Safari, not in-app.
-            if source.fromDirect, navigationAction.navigationType == .linkActivated {
+            // Blocked link tapped while viewing DMs. Group-chat participant
+            // headers often report a non-/direct source frame even though the
+            // web view is on /direct/t/… — fall back to the current URL.
+            if isInDirectContext(webView, navigationAction: navigationAction),
+               navigationAction.navigationType == .linkActivated {
                 NSWorkspace.shared.open(url)
                 decisionHandler(.cancel)
                 return
@@ -222,7 +233,11 @@ struct WebView: NSViewRepresentable {
             // redirects `webView.url` is often still nil/stale, which is why
             // checking only `isOnAuthSurface(webView)` brought the spinner back.
             if navigationAction.navigationType != .linkActivated,
-               shouldAllowAuthRedirect(webView, navigationAction: navigationAction) {
+               shouldAllowAuthRedirect(
+                   webView,
+                   navigationAction: navigationAction,
+                   url: url
+               ) {
                 if authSubmitAt == nil { authSubmitAt = Date() }
                 awaitingInboxHandoff = true
                 decisionHandler(.allow)
@@ -230,11 +245,50 @@ struct WebView: NSViewRepresentable {
             }
 
             decisionHandler(.cancel)
+            webView.stopLoading()
             handleBlocked(
                 url: url,
                 in: webView,
                 navigationType: navigationAction.navigationType
             )
+        }
+
+        /// Cancel blocked main-frame **responses** so HTML never downloads.
+        /// Action-level `.cancel` alone still lets the page flash for seconds
+        /// before `didFinish` fires — this is the early exit.
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationResponse: WKNavigationResponse,
+            decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+        ) {
+            guard navigationResponse.isForMainFrame,
+                  let url = navigationResponse.response.url else {
+                decisionHandler(.allow)
+                return
+            }
+
+            if awaitingInboxHandoff {
+                decisionHandler(.allow)
+                return
+            }
+
+            let fromDirect = NavigationPolicy.isDirectMessagingPath(
+                webView.url?.path ?? ""
+            )
+            let source = NavigationPolicy.Source(fromDirect: fromDirect)
+            if NavigationPolicy.isAllowed(url, source: source) {
+                if !isOnAuthSurface(webView),
+                   !NavigationPolicy.isInAppUserSurface(url.path, source: source) {
+                    decisionHandler(.cancel)
+                    webView.stopLoading()
+                    return
+                }
+                decisionHandler(.allow)
+                return
+            }
+
+            decisionHandler(.cancel)
+            webView.stopLoading()
         }
 
         /// `window.open(...)` / `target="_blank"` clicks come through here.
@@ -277,13 +331,14 @@ struct WebView: NSViewRepresentable {
             // already cancelled, and there's no reason to force a refresh
             // just because something tried to take us somewhere we won't go.
             if let currentURL = webView.url,
-               NavigationPolicy.isAllowed(currentURL) {
+               NavigationPolicy.isAllowed(currentURL),
+               NavigationPolicy.isInAppUserSurface(currentURL.path) {
                 // Silent-cancel on the login page is what causes the infinite
                 // spinner when a post-login redirect gets blocked. If we're
                 // mid-auth (or just submitted credentials), try routing to the
                 // inbox once session cookies exist — they may already be set on
                 // the login POST even when the follow-up redirect was cancelled.
-                if isOnAuthSurface(webView) || isInAuthSubmitWindow() {
+                if isOnAuthSurface(webView) {
                     routeToInboxWhenAuthenticated(in: webView)
                 }
                 return
@@ -333,6 +388,15 @@ struct WebView: NSViewRepresentable {
             guard let current = webView.url else { return }
 
             if NavigationPolicy.isAllowed(current) {
+                let path = current.path
+                let fromDirect = NavigationPolicy.isDirectMessagingPath(path)
+                let source = NavigationPolicy.Source(fromDirect: fromDirect)
+                if !isOnAuthSurface(webView),
+                   !NavigationPolicy.isInAppUserSurface(path, source: source) {
+                    webView.stopLoading()
+                    returnToHome(in: webView)
+                    return
+                }
                 if !isOnAuthSurface(webView) {
                     authSubmitAt = nil
                     awaitingInboxHandoff = false
@@ -347,17 +411,21 @@ struct WebView: NSViewRepresentable {
                 return
             }
 
-            // Never leave the user browsing full Instagram in-app. A brief
-            // flash may show before we return to the tab's home URL.
+            // Never leave the user browsing full Instagram in-app.
+            webView.stopLoading()
             returnToHome(in: webView)
         }
 
         /// Loads `homeURL` when the web view committed to a blocked page.
         private func returnToHome(in webView: WKWebView) {
-            DispatchQueue.main.async { [homeURL] in
-                guard let url = webView.url, !NavigationPolicy.isAllowed(url) else {
+            DispatchQueue.main.async { [homeURL, self] in
+                guard let url = webView.url else { return }
+                let path = url.path
+                if NavigationPolicy.isInAppUserSurface(path)
+                    || isOnAuthSurface(webView) {
                     return
                 }
+                webView.stopLoading()
                 webView.load(URLRequest(url: homeURL))
             }
         }
@@ -367,21 +435,39 @@ struct WebView: NSViewRepresentable {
                 authSubmitAt = Date()
                 return
             }
-            if navigationAction.safeRequest?.httpMethod == "POST",
-               (url.path.contains("login") || url.path.contains("/accounts/")) {
+            guard navigationAction.safeRequest?.httpMethod == "POST" else { return }
+            let path = url.path
+            if path.hasPrefix("/accounts/login") || path.contains("/accounts/login/") {
                 authSubmitAt = Date()
             }
         }
 
         private func shouldAllowAuthRedirect(
             _ webView: WKWebView,
+            navigationAction: WKNavigationAction,
+            url: URL
+        ) -> Bool {
+            guard navigationAction.navigationType != .linkActivated else { return false }
+            guard isOnAuthSurface(webView) || isAuthSource(navigationAction) else {
+                return false
+            }
+            let path = url.path
+            // Only the post-login feed-root hop — never profiles, explore, etc.
+            return path.isEmpty || path == "/"
+        }
+
+        /// True when the user is viewing DMs — uses source frame **or** the
+        /// committed web-view URL. Group-chat UI often fails the source check.
+        private func isInDirectContext(
+            _ webView: WKWebView,
             navigationAction: WKNavigationAction
         ) -> Bool {
-            // Only true mid-login redirects — not the post-login submit window,
-            // which was incorrectly allowing profile/feed URLs to load then
-            // bounce back via `awaitingInboxHandoff`.
-            if isAuthSource(navigationAction) { return true }
-            if isOnAuthSurface(webView) { return true }
+            let sourcePath = navigationAction.sourceFrame.safeRequest?.url?.path ?? ""
+            if NavigationPolicy.isDirectMessagingPath(sourcePath) { return true }
+            if let path = webView.url?.path,
+               NavigationPolicy.isDirectMessagingPath(path) {
+                return true
+            }
             return false
         }
 
@@ -391,11 +477,6 @@ struct WebView: NSViewRepresentable {
             if sourceHost == "accounts.instagram.com" { return true }
             return sourcePath.hasPrefix("/accounts")
                 || sourcePath.hasPrefix("/challenge")
-        }
-
-        private func isInAuthSubmitWindow() -> Bool {
-            guard let submitAt = authSubmitAt else { return false }
-            return Date().timeIntervalSince(submitAt) < authSubmitWindow
         }
 
         /// Loads `homeURL` only after Instagram's `sessionid` cookie is visible.
@@ -414,7 +495,7 @@ struct WebView: NSViewRepresentable {
                         self.authSubmitAt = nil
                         if let current = webView.url,
                            NavigationPolicy.isAllowed(current),
-                           current.path.hasPrefix("/direct") {
+                           NavigationPolicy.isDirectMessagingPath(current.path) {
                             return
                         }
                         webView.load(URLRequest(url: homeURL))
