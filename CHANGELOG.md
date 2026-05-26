@@ -5,22 +5,72 @@ All notable changes to this project are documented here. Dates use
 
 ## [Unreleased]
 
+### Fixed
+- Profile tap while DMs are minimized no longer leaks the full Instagram
+  UI. The leak path is Instagram's React-handled click — `preventDefault()`
+  + `history.pushState('/<username>/')` — which fires **no** navigation
+  event, so `decidePolicyFor` never gets to refuse. URL-only defense in
+  `NavigationPolicy` cannot block this in principle.
+
+  Defense added in `WebView.spaNavigationGuardJS` (documentStart user
+  script, `forMainFrameOnly: true`):
+  - **Capture-phase click listener** on `document` that resolves the
+    target `<a href>`'s path and `preventDefault()` +
+    `stopImmediatePropagation()`s any non-DM path. Runs before IG's
+    bundle hydrates, so IG's delegated handler never sees the click.
+  - **Wraps `history.pushState` / `history.replaceState`** to silently
+    drop URL changes targeting non-DM paths. IG reads the wrapped
+    versions when its bundle loads.
+
+  Allowed prefixes mirror `NavigationPolicy.isDirectMessagingPath` +
+  auth/internal allowlist; update both sides together when adding a
+  surface.
+
+  Side effect: clicking the messenger's "minimize" button is now a
+  no-op (its pushState target is `/direct` or `/`, both blocked). URL
+  stays on the thread; the feed never renders underneath. Matches the
+  DM-only product intent.
+
+### Added
+- `#if DEBUG`-gated `dlog(...)` instrumentation in `WebView.Coordinator`
+  for tracing navigation decisions during regression repros. Filter
+  `Console.app` for `[InstaDM/` to capture the full trace. Release
+  builds compile to a no-op.
+
 ## [1.0.2] - 2026-05-25
 
 ### Fixed
 - Login spinner never completing after entering credentials on macOS 26.
-  Two regressions from the macOS 26 `safeRequest` work and the 2026-05-16
-  silent-cancel path in `handleBlocked`:
-  - When KVC could not read `navigationAction.request`, the delegate
-    cancelled the navigation — that broke login form/AJAX submits and
-    left the Log-in button spinning forever. Unknown URLs now `.allow`
-    instead of `.cancel`.
-  - After a successful login Instagram often 302s through `/` (the feed).
-    `/` is blocked by policy, and the "already on an allowed page → silent
-    cancel" path swallowed that redirect while the web view was still on
-    `/accounts/login/`. Auth pages now bounce to `homeURL` (inbox) when
-    a blocked `/` redirect fires, restoring pre-2026-05-16 behavior for
-    that case only.
+  Root causes and fixes in `WebView.swift`:
+  - Nil `safeRequest` during login AJAX: allow only in auth context (not
+    globally — a global allow leaked full Instagram).
+  - Post-login 302 through `/`: allow redirect to commit Set-Cookie, then
+    cookie-gated route to inbox (`awaitingInboxHandoff` +
+    `routeToInboxWhenAuthenticated`).
+  - Auth redirect detection uses source-frame auth surface, not stale
+    `webView.url`.
+- Full Instagram UI leaking in-app (notifications, search, profiles,
+  group-chat chrome). `NavigationPolicy` + `WebView.Coordinator`:
+  - Replaced blanket `/accounts` prefix with auth-only subpaths
+    (`/accounts/login`, `/accounts/onetap`, …).
+  - Replaced blanket `/direct` with narrowed `isDirectMessagingPath()`
+    (`/direct/inbox`, `/direct/t/`, `/direct/new` only).
+  - Added `isInAppUserSurface()` — internal endpoints (`/api`, …) may
+    load as XHR but must not become the main document.
+  - Cancel blocked navigations at action + response; `stopLoading()` +
+    `didFinish` bounce as safety net.
+  - DM context link taps to blocked URLs open in Safari; group-chat
+    sender taps use `isInDirectContext()` (source frame **or** current URL).
+
+### Changed
+- Cosmetic CSS hides notification / activity / account-edit links in
+  addition to Home / Explore / Reels.
+
+### Notes for maintainers
+- A **WKContentRuleList + didCommit hardening experiment** in the same
+  session was reverted before release — it regressed profile blocking
+  and login handoff. See Obsidian note [[2026-05-25 — Navigation Policy
+  Session and Agent Handoff]] § "Experiments that failed".
 
 ## [1.0.1] - 2026-05-25
 

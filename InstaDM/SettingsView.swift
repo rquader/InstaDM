@@ -20,12 +20,15 @@ struct SettingsView: View {
     // Allowed surfaces (opt-in per feature module)
     @AppStorage(SettingsKey.allowFollowRequests) private var allowFollowRequests = FollowRequests.defaultEnabled
     @AppStorage(SettingsKey.allowSharedPosts)    private var allowSharedPosts    = SharedPosts.defaultEnabled
+    @AppStorage(SettingsKey.openLinksInExternalBrowser)
+    private var openLinksInExternalBrowser = true
 
     @Environment(\.theme) private var theme
 
     var body: some View {
         Form {
             appearanceSection
+            linksSection
             allowedSurfacesSection
             notificationsSection
             footerSection
@@ -35,7 +38,7 @@ struct SettingsView: View {
         // through and the form actually picks up the active palette.
         .scrollContentBackground(.hidden)
         .padding()
-        .frame(width: 480, height: 460)
+        .frame(width: 480, height: 520)
         .background(theme.background)
         .foregroundStyle(theme.text)
     }
@@ -58,6 +61,21 @@ struct SettingsView: View {
             }
         } header: {
             Text("Appearance").foregroundStyle(theme.textSecondary)
+        }
+    }
+
+    private var linksSection: some View {
+        Section {
+            Toggle("Open links in default browser", isOn: $openLinksInExternalBrowser)
+            Text(
+                "After you’re logged in, profile taps and shared links can open in Safari (or your default browser). " +
+                "Turn this off to keep everything in the app — blocked links are cancelled and overlays dismissed instead. " +
+                "Login and account recovery may still use your browser when needed."
+            )
+            .font(.footnote)
+            .foregroundStyle(theme.textSecondary)
+        } header: {
+            Text("Links").foregroundStyle(theme.textSecondary)
         }
     }
 

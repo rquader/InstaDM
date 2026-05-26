@@ -151,11 +151,70 @@ enum NavigationPolicy {
         return false
     }
 
+    /// Main document was outside inbox/threads/auth (profile, feed, stories, …).
+    static func isOutsideDMSurface(_ path: String) -> Bool {
+        if isDirectMessagingPath(path) { return false }
+        if isInAppUserSurface(path) { return false }
+        return true
+    }
+
+    /// Background hops IG fires while you're already on DMs (`/`, explore,
+    /// account-linking prefetch, …). Cancel silently — never `stopLoading()`.
+    static func isIncidentalBlockedPrefetch(_ url: URL) -> Bool {
+        if isOffPlatformURL(url) { return true }
+        guard let host = url.host, allowedHosts.contains(host) else { return false }
+        let path = url.path
+        if path.isEmpty || path == "/" { return true }
+        if path == "/explore" || path.hasPrefix("/explore/") { return true }
+        if path.hasPrefix("/reels") { return true }
+        if path.contains("notifications") { return true }
+        if path.hasPrefix("/accounts/manage") { return true }
+        if path.hasPrefix("/accounts/link") { return true }
+        if path.hasPrefix("/accounts/connected") { return true }
+        if path.contains("meta") && path.hasPrefix("/accounts") { return true }
+        return false
+    }
+
+    /// Non-Instagram hosts (Facebook/Meta account sync, etc.).
+    static func isOffPlatformURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return true }
+        return !allowedHosts.contains(host)
+    }
+
+    /// `/{username}/` — the usual one-click profile escape from a DM thread.
+    static func isProfilePath(_ path: String) -> Bool {
+        let parts = path.split(separator: "/").map(String.init)
+        guard parts.count == 1 else { return false }
+        return isLikelyUsernameSegment(parts[0])
+    }
+
+    /// Blocked in-app page (profile, explore page, …) — not auth/XHR/prefetch.
+    static func isBlockedInAppChrome(_ url: URL, source: Source = .none) -> Bool {
+        if isAllowed(url, source: source) { return false }
+        if isIncidentalBlockedPrefetch(url) { return false }
+        return true
+    }
+
+    /// Main-frame document committed outside DMs — always bounce back (feed,
+    /// profile, bare `/direct` minimize shell, stories, …). Unlike
+    /// `isIncidentalBlockedPrefetch`, which only applies to cancelled background hops.
+    static func shouldRecoverFromMainDocument(_ url: URL, source: Source = .none) -> Bool {
+        guard let host = url.host, allowedHosts.contains(host) else { return true }
+        let path = url.path
+        if path.isEmpty || path == "/" { return true }
+        if path == "/direct" || path == "/direct/" { return true }
+        if isProfilePath(path) { return true }
+        if isDirectMessagingPath(path) { return false }
+        if isInAppUserSurface(path, source: source) { return false }
+        if isAllowed(url, source: source) { return false }
+        return true
+    }
+
     /// DM surfaces the app intentionally exposes — not every `/direct/…` path.
     /// Group-chat sender links can route to other `/direct/…` URLs that render
-    /// full Instagram; those must stay blocked.
+    /// full Instagram; those must stay blocked. Bare `/direct` is the minimized-
+    /// messenger shell and renders full IG — not allowed.
     static func isDirectMessagingPath(_ path: String) -> Bool {
-        if path == "/direct" { return true }
         if path.hasPrefix("/direct/inbox") { return true }
         if path.hasPrefix("/direct/t/") { return true }
         if path.hasPrefix("/direct/new") { return true }
@@ -175,5 +234,22 @@ enum NavigationPolicy {
         prefixes.contains { prefix in
             path == prefix || path.hasPrefix(prefix + "/")
         }
+    }
+
+    /// Reserved first path segments — not profile usernames.
+    private static let reservedTopLevelSegments: Set<String> = [
+        "direct", "accounts", "explore", "reels", "p", "tv", "stories",
+        "about", "legal", "api", "graphql", "static", "challenge",
+        "directory", "session", "nametag", "web", "developer", "privacy",
+        "terms", "lite",
+    ]
+
+    private static func isLikelyUsernameSegment(_ segment: String) -> Bool {
+        guard !segment.isEmpty,
+              !reservedTopLevelSegments.contains(segment.lowercased()) else {
+            return false
+        }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._"))
+        return segment.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 }

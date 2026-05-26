@@ -60,6 +60,11 @@ enum SettingsKey {
     // same UserDefaults entry.
     static let allowFollowRequests = "allowFollowRequests"
     static let allowSharedPosts    = "allowSharedPosts"
+
+    /// When `true`, blocked link taps and `target="_blank"` hops open in the
+    /// user's default browser after login. Login/challenge flows always may
+    /// open externally regardless of this toggle.
+    static let openLinksInExternalBrowser = "openLinksInExternalBrowser"
 }
 
 // MARK: - Read interface
@@ -107,4 +112,9 @@ enum AppSettings {
 
     static var allowFollowRequests: Bool { FollowRequests.enabled }
     static var allowSharedPosts:    Bool { SharedPosts.enabled }
+
+    /// Off after login when the user disables external link opening in Settings.
+    static var openLinksInExternalBrowser: Bool {
+        UserDefaults.standard.object(forKey: SettingsKey.openLinksInExternalBrowser) as? Bool ?? true
+    }
 }

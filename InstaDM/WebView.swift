@@ -33,6 +33,7 @@ struct WebView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()  // persistent cookies
+        configuration.userContentController.addUserScript(Self.spaNavigationGuardJS)
         configuration.userContentController.addUserScript(Self.cosmeticHideNavCSS)
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
@@ -61,6 +62,141 @@ struct WebView: NSViewRepresentable {
             NotificationManager.shared.detach(forWebView: nsView)
         }
     }
+
+    // MARK: - SPA navigation guard
+
+    /// Document-start guard against Instagram SPA navigation patterns that
+    /// no Swift-side URL policy can see.
+    ///
+    /// Two leak classes URL policy can't catch on its own:
+    ///   - **Profile click while DMs are minimized.** Instagram's bundle
+    ///     intercepts the click, calls `preventDefault()` itself, then
+    ///     `history.pushState('/<username>/')` and renders the profile in
+    ///     React. No `decidePolicyFor` fires — there is no navigation
+    ///     event the Swift layer can vote on, so `NavigationPolicy.isAllowed`
+    ///     never gets to refuse the URL.
+    ///   - **Minimize messenger.** A `pushState('/direct')` or `pushState('/')`
+    ///     flips SPA state to render the feed under a small messenger
+    ///     bubble. Same story — no navigation event.
+    ///
+    /// We defend at the JavaScript layer, before React's delegated click
+    /// handler runs:
+    ///   1. **Capture-phase click listener** on `document`. Any `<a>` whose
+    ///      `href` resolves to a non-DM path gets `preventDefault()` +
+    ///      `stopImmediatePropagation()` — which also prevents React from
+    ///      ever seeing the click. Registered at `documentStart` so we
+    ///      precede any listener IG installs from its bundle.
+    ///   2. **Wraps `history.pushState` / `history.replaceState`** to
+    ///      silently drop URL changes targeting non-DM paths. IG's
+    ///      bundle reads `history.pushState` AFTER us, so it gets the
+    ///      wrapped version.
+    ///
+    /// Allowed prefixes mirror `NavigationPolicy.isDirectMessagingPath` +
+    /// the auth / internal allowlist. **These two lists will drift if you
+    /// only update one side** — update this script whenever you touch the
+    /// Swift allowlist.
+    ///
+    /// Side effect: clicking the messenger's "minimize" button no-ops.
+    /// URL stays on the thread, the feed never gets to render underneath.
+    /// That matches the DM-only product intent — minimizing into a feed
+    /// is exactly the leak this app exists to prevent.
+    private static let spaNavigationGuardJS: WKUserScript = {
+        let source = """
+        (function() {
+            if (window.__InstaDMNavGuard) { return; }
+            window.__InstaDMNavGuard = true;
+
+            function pathAllowed(path) {
+                if (!path) { return false; }
+                return (
+                    path.indexOf('/direct/inbox') === 0
+                    || path.indexOf('/direct/t/') === 0
+                    || path.indexOf('/direct/new') === 0
+                    || path.indexOf('/accounts/login') === 0
+                    || path.indexOf('/accounts/onetap') === 0
+                    || path.indexOf('/accounts/password') === 0
+                    || path.indexOf('/accounts/signup') === 0
+                    || path.indexOf('/accounts/emailsignup') === 0
+                    || path.indexOf('/accounts/check_email') === 0
+                    || path.indexOf('/accounts/logout') === 0
+                    || path.indexOf('/accounts/confirm') === 0
+                    || path.indexOf('/accounts/access') === 0
+                    || path.indexOf('/accounts/account_recovery') === 0
+                    || path.indexOf('/accounts/username') === 0
+                    || path.indexOf('/challenge') === 0
+                    || path.indexOf('/api') === 0
+                    || path.indexOf('/graphql') === 0
+                    || path.indexOf('/ajax') === 0
+                    || path.indexOf('/static') === 0
+                );
+            }
+
+            function resolvePath(href) {
+                if (!href || typeof href !== 'string') { return null; }
+                if (href.charAt(0) === '#') { return null; }
+                try {
+                    var u = new URL(href, location.href);
+                    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+                        return null;
+                    }
+                    if (u.host !== location.host) { return null; }
+                    return u.pathname || '/';
+                } catch (e) {
+                    return null;
+                }
+            }
+
+            function blockEvent(e) {
+                try {
+                    e.preventDefault();
+                    if (typeof e.stopImmediatePropagation === 'function') {
+                        e.stopImmediatePropagation();
+                    }
+                    e.stopPropagation();
+                } catch (err) { /* defensive */ }
+            }
+
+            function clickHandler(e) {
+                var t = e.target;
+                if (!t || !t.closest) { return; }
+                var a = t.closest('a[href]');
+                if (!a) { return; }
+                var path = resolvePath(a.getAttribute('href'));
+                if (path === null) { return; }
+                if (pathAllowed(path)) { return; }
+                blockEvent(e);
+            }
+
+            document.addEventListener('click', clickHandler, true);
+            document.addEventListener('auxclick', clickHandler, true);
+
+            function wrapHistory(name) {
+                var orig = history[name];
+                if (typeof orig !== 'function' || orig.__instaDMWrapped) {
+                    return;
+                }
+                var wrapped = function(state, title, url) {
+                    if (typeof url === 'string' && url.length > 0) {
+                        var path = resolvePath(url);
+                        if (path !== null && !pathAllowed(path)) {
+                            return undefined;
+                        }
+                    }
+                    return orig.apply(this, arguments);
+                };
+                wrapped.__instaDMWrapped = true;
+                history[name] = wrapped;
+            }
+            wrapHistory('pushState');
+            wrapHistory('replaceState');
+        })();
+        """
+        return WKUserScript(
+            source: source,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+    }()
 
     // MARK: - Cosmetic CSS
 
@@ -131,25 +267,17 @@ struct WebView: NSViewRepresentable {
         /// that attached it.
         let tracksNotifications: Bool
 
-        /// Timestamp of the most recent bounce-to-`homeURL`. Read by
-        /// `handleBlocked` as a loop guard: if `homeURL` itself triggers
-        /// a server-side redirect into a blocked URL, the first bounce
-        /// will fire again immediately, and again, and again. The
-        /// cooldown breaks that cycle. See `bounceCooldown` for the
-        /// window length and the comment in `handleBlocked` for the full
-        /// reasoning.
-        private var lastBounceAt: Date?
+        /// Reload loops where `homeURL` 302s before any URL commits (`webView.url`
+        /// stays nil). User-visible blocked pages always recover — never gated
+        /// by this counter.
+        private var nilUrlLoopCount = 0
 
-        /// Minimum gap between consecutive bounces to `homeURL`. If a
-        /// second bounce would fire inside this window, we abandon
-        /// instead — the page is genuinely unreachable under the current
-        /// policy, and looping wastes CPU + battery without ever
-        /// resolving. Five seconds is short enough that a transient
-        /// network blip won't permanently strand the user (they can
-        /// switch tabs and back, or relaunch) and long enough that the
-        /// redirect chain from a 302-into-blocked-URL pattern will have
-        /// finished firing.
-        private let bounceCooldown: TimeInterval = 5.0
+        private let maxNilUrlLoopCount = 8
+
+        /// Coalesces recovery loads when a blocked **page** actually commits.
+        private var pendingRecovery: DispatchWorkItem?
+
+        private let recoveryDebounce: TimeInterval = 0.12
 
         /// Set when the user submits credentials; post-login blocked redirects
         /// are only allowed inside this window so idle prefetch on the login
@@ -160,10 +288,51 @@ struct WebView: NSViewRepresentable {
         /// URL so `didFinish` can route to the inbox once `sessionid` exists.
         private var awaitingInboxHandoff = false
 
+        /// True after the first successful inbox/thread load. Guards scroll-only
+        /// optimizations so they never interfere with cold launch.
+        private var hasSettledOnUserSurface = false
+
+        /// Last committed inbox/thread URL — used to bounce back from a blocked
+        /// page without always dumping the user at the inbox root.
+        private var lastDMSurfaceURL: URL?
+
+        /// Previous main-frame path — detects returns to DMs from profile/feed/etc.
+        private var lastCommittedPath: String?
+
+        /// Set when full IG chrome leaks; cleared by `restoreDMSurface`.
+        private var surfaceNeedsHeal = false
+
+        /// Prevents heal-reload loops.
+        private var isRestoringDMSurface = false
+
+        /// Rate-limit overlay-dismiss JS so rapid prefetch bursts don't stack.
+        private var lastChromeDismissAt: Date?
+
+        private let chromeDismissCooldown: TimeInterval = 0.35
+
         init(homeURL: URL, tracksNotifications: Bool) {
             self.homeURL = homeURL
             self.tracksNotifications = tracksNotifications
         }
+
+        // MARK: - DEBUG instrumentation
+
+        /// Diagnostic log used to trace navigation decisions when reproducing
+        /// SPA-layer leaks (profile click while DMs are minimized, scroll
+        /// pagination → reload, white-screen launch). `#if DEBUG` only —
+        /// Release builds compile to a no-op, so production users never see
+        /// these in `Console.app`.
+        ///
+        /// Filter `Console.app` for `[InstaDM/` to capture the full trace
+        /// during a repro. `@autoclosure` means the `details` string is only
+        /// built when the log actually fires.
+        private func dlog(_ tag: String, _ details: @autoclosure () -> String = "") {
+            #if DEBUG
+            NSLog("%@", "[InstaDM/\(tag)] \(details())")
+            #endif
+        }
+
+        // MARK: - Navigation policy
 
         func webView(
             _ webView: WKWebView,
@@ -201,6 +370,11 @@ struct WebView: NSViewRepresentable {
                 fromDirect: NavigationPolicy.isDirectMessagingPath(sourcePath)
             )
 
+            dlog(
+                "decideAction.in",
+                "url=\(url.absoluteString) wv=\(webView.url?.absoluteString ?? "nil") type=\(navigationAction.navigationType.rawValue) src=\(sourcePath.isEmpty ? "nil" : sourcePath) inDMSession=\(isInDMSession(webView)) settled=\(hasSettledOnUserSurface)"
+            )
+
             if isOnAuthSurface(webView) || isAuthSource(navigationAction) {
                 noteAuthSubmit(navigationAction, url: url)
             }
@@ -210,20 +384,36 @@ struct WebView: NSViewRepresentable {
                    !isAuthSource(navigationAction),
                    !NavigationPolicy.isInAppUserSurface(url.path, source: source) {
                     decisionHandler(.cancel)
-                    webView.stopLoading()
+                    // Still on DMs — don't stopLoading(); that aborts pagination
+                    // XHR and other in-flight requests while scrolling history.
+                    return
+                }
+                // Open threads only: IG sometimes re-navigates the same thread
+                // (`.other`) when paginating history — allowing it reloads and
+                // snaps scroll to the bottom. Never apply during cold launch.
+                if hasSettledOnUserSurface,
+                   navigationAction.navigationType == .other,
+                   let current = webView.url,
+                   current.path.hasPrefix("/direct/t/"),
+                   refersToSameDMSurface(current, url) {
+                    decisionHandler(.cancel)
                     return
                 }
                 decisionHandler(.allow)
                 return
             }
 
-            // Blocked link tapped while viewing DMs. Group-chat participant
-            // headers often report a non-/direct source frame even though the
-            // web view is on /direct/t/… — fall back to the current URL.
-            if isInDirectContext(webView, navigationAction: navigationAction),
-               navigationAction.navigationType == .linkActivated {
-                NSWorkspace.shared.open(url)
+            // Blocked navigation during an active DM session (includes minimized
+            // messenger — URL may be `/`, bare `/direct`, or still on inbox).
+            if isInDMSession(webView)
+                || isInDirectContext(webView, navigationAction: navigationAction) {
                 decisionHandler(.cancel)
+                handleBlockedWhileOnDMs(
+                    url: url,
+                    navigationAction: navigationAction,
+                    in: webView,
+                    source: source
+                )
                 return
             }
 
@@ -245,10 +435,21 @@ struct WebView: NSViewRepresentable {
             }
 
             decisionHandler(.cancel)
+
+            if isViewingInAppUserSurface(webView) {
+                handleBlockedWhileOnDMs(
+                    url: url,
+                    navigationAction: navigationAction,
+                    in: webView,
+                    source: source
+                )
+                return
+            }
             webView.stopLoading()
             handleBlocked(
                 url: url,
                 in: webView,
+                navigationAction: navigationAction,
                 navigationType: navigationAction.navigationType
             )
         }
@@ -267,8 +468,18 @@ struct WebView: NSViewRepresentable {
                 return
             }
 
+            dlog(
+                "decideResponse.in",
+                "url=\(url.absoluteString) wv=\(webView.url?.absoluteString ?? "nil") awaitingInboxHandoff=\(awaitingInboxHandoff)"
+            )
+
             if awaitingInboxHandoff {
-                decisionHandler(.allow)
+                let path = url.path
+                if path.isEmpty || path == "/" {
+                    decisionHandler(.allow)
+                    return
+                }
+                decisionHandler(.cancel)
                 return
             }
 
@@ -280,7 +491,6 @@ struct WebView: NSViewRepresentable {
                 if !isOnAuthSurface(webView),
                    !NavigationPolicy.isInAppUserSurface(url.path, source: source) {
                     decisionHandler(.cancel)
-                    webView.stopLoading()
                     return
                 }
                 decisionHandler(.allow)
@@ -288,7 +498,25 @@ struct WebView: NSViewRepresentable {
             }
 
             decisionHandler(.cancel)
+            if isViewingInAppUserSurface(webView) {
+                if NavigationPolicy.isBlockedInAppChrome(url, source: source) {
+                    markSurfaceCompromised()
+                    dismissInstagramChrome(in: webView)
+                    scheduleDelayedChromeDismiss(in: webView)
+                    if NavigationPolicy.isProfilePath(url.path) {
+                        reboundToLastDMSurface(in: webView)
+                    }
+                }
+                return
+            }
+            if isInDMSession(webView),
+               NavigationPolicy.shouldRecoverFromMainDocument(url, source: source) {
+                markSurfaceCompromised()
+                scheduleRecovery(in: webView, url: lastDMSurfaceURL ?? homeURL, force: true)
+                return
+            }
             webView.stopLoading()
+            scheduleRecovery(in: webView, url: homeURL)
         }
 
         /// `window.open(...)` / `target="_blank"` clicks come through here.
@@ -303,7 +531,7 @@ struct WebView: NSViewRepresentable {
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
             if let url = navigationAction.safeRequest?.url {
-                NSWorkspace.shared.open(url)
+                openInExternalBrowserIfAllowed(url, in: webView)
             }
             return nil
         }
@@ -311,81 +539,262 @@ struct WebView: NSViewRepresentable {
         private func handleBlocked(
             url: URL,
             in webView: WKWebView,
+            navigationAction: WKNavigationAction,
             navigationType: WKNavigationType
         ) {
             // User-initiated link click to a non-allowed URL → open in
             // Safari so the "friend shared something we don't render" flow
             // still works gracefully.
             if navigationType == .linkActivated {
-                NSWorkspace.shared.open(url)
+                openInExternalBrowserIfAllowed(
+                    url,
+                    in: webView,
+                    navigationAction: navigationAction
+                )
                 return
             }
-            // If we're already on an allowed page, do nothing — just cancel
-            // the unwanted navigation. Bouncing to homeURL when we're
-            // already on a fine page (the inbox, a thread, the requests
-            // tab's follow-requests page) causes an infinite reload loop:
-            // Instagram's page JS triggers a blocked nav → we reload home →
-            // home's JS triggers another blocked nav → we reload again, etc.
-            //
-            // This silent-cancel is the right move: the unwanted nav is
-            // already cancelled, and there's no reason to force a refresh
-            // just because something tried to take us somewhere we won't go.
             if let currentURL = webView.url,
                NavigationPolicy.isAllowed(currentURL),
                NavigationPolicy.isInAppUserSurface(currentURL.path) {
-                // Silent-cancel on the login page is what causes the infinite
-                // spinner when a post-login redirect gets blocked. If we're
-                // mid-auth (or just submitted credentials), try routing to the
-                // inbox once session cookies exist — they may already be set on
-                // the login POST even when the follow-up redirect was cancelled.
                 if isOnAuthSurface(webView) {
                     routeToInboxWhenAuthenticated(in: webView)
                 }
                 return
             }
-            // Loop guard: a second layer of defense for the case the
-            // above check can't catch — when `homeURL` itself triggers a
-            // server-side 302 to a blocked URL. In that scenario
-            // `webView.url` is still nil/empty (the redirect target
-            // never committed), so the "already on an allowed page"
-            // check above lets us through, and we'd bounce back to
-            // `homeURL` → 302 → blocked → bounce → forever.
-            //
-            // If we bounced within the cooldown window, the bounce
-            // target is most likely the source of the redirect we just
-            // blocked. A second bounce would just reproduce the loop.
-            // Abandon — leave the web view in its empty state. The user
-            // can switch tabs or relaunch; we don't burn CPU spinning.
-            // Historical symptom this prevents: the Requests tab
-            // infinite-reloading on `/accounts/activity/?followRequests=1`
-            // when Instagram 302s that path into a non-allowlisted URL.
-            if let last = lastBounceAt,
-               Date().timeIntervalSince(last) < bounceCooldown {
+            if webView.url == nil {
+                nilUrlLoopCount += 1
+                if nilUrlLoopCount >= maxNilUrlLoopCount {
+                    return
+                }
+            } else {
+                nilUrlLoopCount = 0
+            }
+            scheduleRecovery(in: webView, url: homeURL)
+        }
+
+        /// Blocked navigation while the committed URL is still a DM surface.
+        /// Never `stopLoading()` — that aborts scroll pagination XHR.
+        /// Safari opens only for an explicit link click, not `.other` prefetch.
+        private func handleBlockedWhileOnDMs(
+            url: URL,
+            navigationAction: WKNavigationAction,
+            in webView: WKWebView,
+            source: NavigationPolicy.Source
+        ) {
+            let isExplicitLinkClick = navigationAction.navigationType == .linkActivated
+
+            dlog(
+                "blockedOnDMs.in",
+                "url=\(url.absoluteString) wv=\(webView.url?.absoluteString ?? "nil") type=\(navigationAction.navigationType.rawValue) isExplicit=\(isExplicitLinkClick) isProfile=\(NavigationPolicy.isProfilePath(url.path)) isIncidental=\(NavigationPolicy.isIncidentalBlockedPrefetch(url)) isOffPlatform=\(NavigationPolicy.isOffPlatformURL(url))"
+            )
+
+            if NavigationPolicy.isIncidentalBlockedPrefetch(url),
+               !NavigationPolicy.isProfilePath(url.path) {
+                dlog("blockedOnDMs.skipIncidental", "url=\(url.absoluteString)")
                 return
             }
-            // We're on an unknown / non-allowed page (typically the
-            // initial blank load, or a state we got into during a
-            // redirect chain). Land on homeURL. Record the timestamp
-            // first so a back-to-back blocked redirect can detect the
-            // loop and bail. Async to avoid reentering the decision
-            // handler synchronously.
-            lastBounceAt = Date()
-            DispatchQueue.main.async { [homeURL] in
-                webView.load(URLRequest(url: homeURL))
+
+            if NavigationPolicy.isOffPlatformURL(url) {
+                if isExplicitLinkClick {
+                    openInExternalBrowserIfAllowed(
+                        url,
+                        in: webView,
+                        navigationAction: navigationAction
+                    )
+                }
+                markSurfaceCompromised()
+                reboundToLastDMSurface(in: webView)
+                return
+            }
+
+            markSurfaceCompromised()
+            dismissInstagramChrome(in: webView)
+            scheduleDelayedChromeDismiss(in: webView)
+
+            if isExplicitLinkClick {
+                openInExternalBrowserIfAllowed(
+                    url,
+                    in: webView,
+                    navigationAction: navigationAction
+                )
+            }
+
+            if NavigationPolicy.isProfilePath(url.path)
+                || NavigationPolicy.isBlockedInAppChrome(url, source: source)
+                || !isViewingInAppUserSurface(webView) {
+                reboundToLastDMSurface(in: webView)
             }
         }
 
-        /// Clear the bounce-cooldown timestamp on any successful
-        /// navigation. A successful load means we're no longer in a
-        /// stuck-loop state and a future blocked redirect should be
-        /// allowed to bounce home again. Without this, a user who hit
-        /// the loop guard, then navigated away (e.g. switched tabs) and
-        /// back, would inherit a stale timestamp and bouncing might be
-        /// suppressed when it shouldn't be.
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            lastBounceAt = nil
+        /// Active DM session — stays true after first inbox load until the app quits.
+        private func isInDMSession(_ webView: WKWebView) -> Bool {
+            hasSettledOnUserSurface
+                && lastDMSurfaceURL != nil
+                && !isOnAuthSurface(webView)
+        }
 
+        private func reboundToLastDMSurface(in webView: WKWebView) {
+            guard let target = lastDMSurfaceURL ?? (
+                webView.url.flatMap {
+                    NavigationPolicy.isDirectMessagingPath($0.path) ? $0 : nil
+                }
+            ) else {
+                dlog("rebound.fallbackHome", "wv=\(webView.url?.absoluteString ?? "nil")")
+                scheduleRecovery(in: webView, url: homeURL, force: true)
+                return
+            }
+            dlog("rebound.toLastDM", "target=\(target.absoluteString) wv=\(webView.url?.absoluteString ?? "nil")")
+            restoreDMSurface(in: webView, url: target)
+        }
+
+        /// Login/challenge may need Facebook/Meta in the browser; after that,
+        /// respect Settings → Open links in default browser.
+        private func mayOpenExternalBrowser(
+            in webView: WKWebView,
+            navigationAction: WKNavigationAction? = nil
+        ) -> Bool {
+            if isOnAuthSurface(webView) { return true }
+            if awaitingInboxHandoff { return true }
+            if let navigationAction, isAuthSource(navigationAction) { return true }
+            return AppSettings.openLinksInExternalBrowser
+        }
+
+        private func openInExternalBrowserIfAllowed(
+            _ url: URL,
+            in webView: WKWebView,
+            navigationAction: WKNavigationAction? = nil
+        ) {
+            guard mayOpenExternalBrowser(in: webView, navigationAction: navigationAction) else {
+                return
+            }
+            NSWorkspace.shared.open(url)
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            guard hasSettledOnUserSurface, let url = webView.url else { return }
+
+            if awaitingInboxHandoff {
+                let path = url.path
+                if path.isEmpty || path == "/" {
+                    webView.stopLoading()
+                    awaitingInboxHandoff = false
+                    routeToInboxWhenAuthenticated(in: webView)
+                }
+                return
+            }
+
+            if isOnAuthSurface(webView) { return }
+
+            let path = url.path
+            let source = NavigationPolicy.Source(
+                fromDirect: NavigationPolicy.isDirectMessagingPath(path)
+            )
+            if NavigationPolicy.isInAppUserSurface(path, source: source) { return }
+            if NavigationPolicy.isAllowed(url, source: source) { return }
+            guard NavigationPolicy.shouldRecoverFromMainDocument(url, source: source) else {
+                return
+            }
+
+            dlog(
+                "didCommit.recover",
+                "wv=\(url.absoluteString) target=\((lastDMSurfaceURL ?? homeURL).absoluteString)"
+            )
+            markSurfaceCompromised()
+            webView.stopLoading()
+            scheduleRecovery(in: webView, url: lastDMSurfaceURL ?? homeURL, force: true)
+        }
+
+        /// Debounced reload — only when a blocked surface actually committed.
+        private func scheduleRecovery(in webView: WKWebView, url: URL, force: Bool = false) {
+            if !force {
+                if let current = webView.url, refersToSameDMSurface(current, url) {
+                    return
+                }
+                // A blocked background nav was cancelled while DMs are still visible.
+                if isViewingInAppUserSurface(webView) {
+                    return
+                }
+            }
+            pendingRecovery?.cancel()
+            let work = DispatchWorkItem { [weak webView] in
+                guard let webView else { return }
+                if !force, self.isViewingInAppUserSurface(webView) { return }
+                self.surfaceNeedsHeal = false
+                webView.stopLoading()
+                webView.load(URLRequest(url: url))
+            }
+            pendingRecovery = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + recoveryDebounce,
+                execute: work
+            )
+        }
+
+        private func isViewingInAppUserSurface(_ webView: WKWebView) -> Bool {
+            guard let path = webView.url?.path else { return false }
+            return NavigationPolicy.isInAppUserSurface(path)
+        }
+
+        /// Avoid reloading the same thread/inbox — that resets scroll position.
+        private func refersToSameDMSurface(_ current: URL, _ target: URL) -> Bool {
+            if current.absoluteString == target.absoluteString { return true }
+            let currentPath = current.path
+            let targetPath = target.path
+            if NavigationPolicy.isDirectMessagingPath(currentPath),
+               NavigationPolicy.isDirectMessagingPath(targetPath),
+               currentPath == targetPath {
+                return true
+            }
+            return false
+        }
+
+        private func markSettledOnUserSurface(from url: URL) {
+            nilUrlLoopCount = 0
+            hasSettledOnUserSurface = true
+            if NavigationPolicy.isDirectMessagingPath(url.path) {
+                lastDMSurfaceURL = url
+            }
+            pendingRecovery?.cancel()
+            pendingRecovery = nil
+        }
+
+        private func markSurfaceCompromised() {
+            surfaceNeedsHeal = true
+        }
+
+        /// True when the user navigated back to a DM route from profile, feed,
+        /// stories, notifications chrome, etc., or overlay leak was detected.
+        private func shouldRestoreDMSurface(landingOn path: String) -> Bool {
+            guard hasSettledOnUserSurface,
+                  !isRestoringDMSurface,
+                  NavigationPolicy.isDirectMessagingPath(path) else {
+                return false
+            }
+            if surfaceNeedsHeal { return true }
+            guard let last = lastCommittedPath else { return false }
+            return NavigationPolicy.isOutsideDMSurface(last)
+        }
+
+        /// One clean reload of a DM URL after IG chrome leaked — only on return
+        /// to DMs, never during normal inbox ↔ thread hops or scroll pagination.
+        private func restoreDMSurface(in webView: WKWebView, url: URL) {
+            dlog("restoreDM.in", "target=\(url.absoluteString) wasRestoring=\(isRestoringDMSurface) wv=\(webView.url?.absoluteString ?? "nil")")
+            guard !isRestoringDMSurface else { return }
+            isRestoringDMSurface = true
+            surfaceNeedsHeal = false
+            pendingRecovery?.cancel()
+            pendingRecovery = nil
+            dismissInstagramChrome(in: webView)
+            webView.load(URLRequest(url: url))
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             guard let current = webView.url else { return }
+
+            dlog(
+                "didFinish.in",
+                "wv=\(current.absoluteString) onAuth=\(isOnAuthSurface(webView)) settled=\(hasSettledOnUserSurface) needsHeal=\(surfaceNeedsHeal) restoring=\(isRestoringDMSurface) lastDMSurface=\(lastDMSurfaceURL?.absoluteString ?? "nil")"
+            )
 
             if NavigationPolicy.isAllowed(current) {
                 let path = current.path
@@ -393,40 +802,92 @@ struct WebView: NSViewRepresentable {
                 let source = NavigationPolicy.Source(fromDirect: fromDirect)
                 if !isOnAuthSurface(webView),
                    !NavigationPolicy.isInAppUserSurface(path, source: source) {
+                    if hasSettledOnUserSurface {
+                        lastCommittedPath = path
+                        return
+                    }
                     webView.stopLoading()
-                    returnToHome(in: webView)
+                    scheduleRecovery(in: webView, url: homeURL)
+                    lastCommittedPath = path
                     return
                 }
+
+                if !isOnAuthSurface(webView),
+                   shouldRestoreDMSurface(landingOn: path) {
+                    restoreDMSurface(in: webView, url: current)
+                    return
+                }
+
+                if isRestoringDMSurface {
+                    isRestoringDMSurface = false
+                }
+
                 if !isOnAuthSurface(webView) {
                     authSubmitAt = nil
                     awaitingInboxHandoff = false
+                    markSettledOnUserSurface(from: current)
                 }
+                lastCommittedPath = path
                 return
             }
 
             // Landed on a blocked surface (profile, feed, explore, …).
+            dlog(
+                "didFinish.blocked",
+                "wv=\(current.absoluteString) target=\((lastDMSurfaceURL ?? homeURL).absoluteString) awaitingInboxHandoff=\(awaitingInboxHandoff)"
+            )
+            markSurfaceCompromised()
             if awaitingInboxHandoff {
                 awaitingInboxHandoff = false
                 routeToInboxWhenAuthenticated(in: webView)
+                lastCommittedPath = current.path
                 return
             }
 
-            // Never leave the user browsing full Instagram in-app.
             webView.stopLoading()
-            returnToHome(in: webView)
+            scheduleRecovery(in: webView, url: lastDMSurfaceURL ?? homeURL, force: true)
+            lastCommittedPath = current.path
         }
 
-        /// Loads `homeURL` when the web view committed to a blocked page.
-        private func returnToHome(in webView: WKWebView) {
-            DispatchQueue.main.async { [homeURL, self] in
-                guard let url = webView.url else { return }
-                let path = url.path
-                if NavigationPolicy.isInAppUserSurface(path)
-                    || isOnAuthSurface(webView) {
-                    return
-                }
-                webView.stopLoading()
-                webView.load(URLRequest(url: homeURL))
+        /// Pop IG's in-page profile/modal chrome without reloading the thread.
+        private func dismissInstagramChrome(in webView: WKWebView) {
+            if let last = lastChromeDismissAt,
+               Date().timeIntervalSince(last) < chromeDismissCooldown {
+                return
+            }
+            lastChromeDismissAt = Date()
+            webView.evaluateJavaScript(
+                """
+                (function() {
+                    var close = document.querySelector(
+                        'button[aria-label="Close"], [role="button"][aria-label="Close"], ' +
+                        'button[aria-label="Back"], [role="button"][aria-label="Back"]'
+                    );
+                    if (!close) {
+                        var svg = document.querySelector(
+                            'svg[aria-label="Close"], svg[aria-label="Back"]'
+                        );
+                        close = svg && svg.closest('button');
+                    }
+                    if (close) { close.click(); return 'close'; }
+                    document.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true
+                    }));
+                    if (window.history.length > 1) {
+                        window.history.back();
+                        return 'back';
+                    }
+                    return 'none';
+                })();
+                """
+            )
+        }
+
+        private func scheduleDelayedChromeDismiss(in webView: WKWebView) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self, weak webView] in
+                guard let self, let webView else { return }
+                self.lastChromeDismissAt = nil
+                self.dismissInstagramChrome(in: webView)
             }
         }
 
@@ -462,6 +923,7 @@ struct WebView: NSViewRepresentable {
             _ webView: WKWebView,
             navigationAction: WKNavigationAction
         ) -> Bool {
+            if isInDMSession(webView) { return true }
             let sourcePath = navigationAction.sourceFrame.safeRequest?.url?.path ?? ""
             if NavigationPolicy.isDirectMessagingPath(sourcePath) { return true }
             if let path = webView.url?.path,
