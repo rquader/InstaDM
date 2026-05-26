@@ -24,9 +24,10 @@ challenge / internal AJAX) is blocked. Reels and posts in your messages open pro
 
 ## Install
 
-1. Download the latest `InstaDM.app.zip` from the
-   [**Releases page**](https://github.com/rquader/InstaDM/releases).
-2. Unzip it and drag `InstaDM.app` into `/Applications`.
+1. Download **`InstaDM.app.zip`** from the
+   [**latest release**](https://github.com/rquader/InstaDM/releases/latest).
+2. If you already have InstaDM in `/Applications`, delete the old
+   `InstaDM.app` first, then unzip and drag the new one in.
 3. First launch only: right-click the app → **Open** so macOS accepts
    the unsigned build. Alternatively, run once in Terminal:
 
