@@ -50,6 +50,7 @@ enum NavigationPolicy {
         "/accounts/access",
         "/accounts/account_recovery",
         "/accounts/username",
+        "/accounts/two_factor",
     ]
 
     /// Path prefixes on `*.instagram.com` that the app always permits,
