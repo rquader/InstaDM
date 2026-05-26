@@ -37,36 +37,28 @@ enum NavigationPolicy {
         "accounts.instagram.com",
     ]
 
+    /// Auth account subpaths only — not a blanket `/accounts` prefix.
+    private static let authAccountPathPrefixes: [String] = [
+        "/accounts/login",
+        "/accounts/onetap",
+        "/accounts/password",
+        "/accounts/signup",
+        "/accounts/emailsignup",
+        "/accounts/check_email",
+        "/accounts/logout",
+        "/accounts/confirm",
+        "/accounts/access",
+        "/accounts/account_recovery",
+        "/accounts/username",
+    ]
+
     /// Path prefixes on `*.instagram.com` that the app always permits,
     /// regardless of feature toggles.
     ///
     /// `/accounts/*` is **deliberately narrowed** to specific auth
-    /// subpaths. A blanket `/accounts` would silently let in
-    /// `/accounts/activity` (follow requests), `/accounts/edit`,
-    /// `/accounts/notifications`, etc. — surfaces this app exists to hide.
+    /// subpaths via `authAccountPathPrefixes`. A blanket `/accounts` would
+    /// silently let in `/accounts/activity`, `/accounts/notifications`, etc.
     private static let alwaysAllowedPathPrefixes: [String] = [
-        // Messaging — covers 1:1 DMs, group chats, and `/direct/new` compose.
-        "/direct",
-
-        // Auth surfaces. **Broadened to the entire `/accounts` tree** after
-        // the narrowed list (login/onetap/password/signup/emailsignup/
-        // check_email/logout) broke the login loop in practice on 2026-05-16
-        // — Instagram's post-login redirect hits something else under
-        // `/accounts/*` we hadn't enumerated, and our bounce-to-inbox sends
-        // the user right back to login.
-        //
-        // Trade-off: this lets `/accounts/edit`, `/accounts/notifications`,
-        // `/accounts/manage_access` etc. through if Instagram chrome links
-        // to them. The Follow-Requests feature module still gates its tab
-        // separately, so it remains "off by default" in the UI sense, but
-        // the URL itself is now reachable if the user finds a link to it.
-        //
-        // To re-narrow safely later: log blocked URLs (add NSLog in the
-        // navigation delegate), capture the real post-login redirect chain,
-        // and enumerate the missing subpath. See [[Risks and Failure Modes]]
-        // § "Highest-risk drift point" for the diagnostic recipe.
-        "/accounts",
-
         // Security checkpoints (e.g. "we noticed an unusual login").
         "/challenge",
 
@@ -76,6 +68,30 @@ enum NavigationPolicy {
         "/graphql",
         "/ajax",
         "/static",
+    ]
+
+    // MARK: - JS guard allowlists (per-tab scope)
+
+    /// Path prefixes that the document-start JS guard in
+    /// `WebView.spaNavigationGuardScript` permits **regardless of which
+    /// tab hosts the web view** — auth, challenge, and internal XHR
+    /// endpoints. Without these, the page can't authenticate or fire its
+    /// own AJAX. Tabs add their feature-specific prefixes on top.
+    static let jsCommonAllowedPathPrefixes: [String] =
+        authAccountPathPrefixes + alwaysAllowedPathPrefixes
+
+    /// JS-guard allowlist for the Messages tab — direct-messaging surfaces.
+    ///
+    /// Mirrors `isDirectMessagingPath`. If you add a DM subpath here,
+    /// extend `isDirectMessagingPath` to match (and vice versa) or the
+    /// click-layer JS guard will fall out of sync with the URL-layer
+    /// Swift policy: anchor clicks to the new surface would be blocked
+    /// at the capture phase even though `decidePolicyFor` would allow
+    /// them, and the new surface would simply do nothing in the UI.
+    static let jsMessagesTabAllowedPathPrefixes: [String] = [
+        "/direct/inbox",
+        "/direct/t/",
+        "/direct/new",
     ]
 
     // MARK: - Source context
@@ -111,7 +127,15 @@ enum NavigationPolicy {
         // and reroutes to the tab's home URL.
         if path.isEmpty || path == "/" { return false }
 
-        // Base allowlist — messaging, auth, internal endpoints.
+        if isDirectMessagingPath(path) {
+            return true
+        }
+
+        if pathMatches(path, anyOf: authAccountPathPrefixes) {
+            return true
+        }
+
+        // Base allowlist — challenge + internal endpoints.
         if pathMatches(path, anyOf: alwaysAllowedPathPrefixes) {
             return true
         }
@@ -133,6 +157,94 @@ enum NavigationPolicy {
         return false
     }
 
+    /// User-facing surfaces the web view should stay on after login.
+    /// Auth paths and internal XHR endpoints are allowed for loading but
+    /// should not persist as the main document.
+    static func isInAppUserSurface(_ path: String, source: Source = .none) -> Bool {
+        if isDirectMessagingPath(path) { return true }
+        if pathMatches(path, anyOf: authAccountPathPrefixes) { return true }
+        if pathMatches(path, anyOf: ["/challenge"]) { return true }
+        if FollowRequests.enabled,
+           pathMatches(path, anyOf: FollowRequests.allowedPathPrefixes) {
+            return true
+        }
+        if SharedPosts.enabled, source.fromDirect,
+           pathMatches(path, anyOf: SharedPosts.allowedPathPrefixes) {
+            return true
+        }
+        return false
+    }
+
+    /// Main document was outside inbox/threads/auth (profile, feed, stories, …).
+    static func isOutsideDMSurface(_ path: String) -> Bool {
+        if isDirectMessagingPath(path) { return false }
+        if isInAppUserSurface(path) { return false }
+        return true
+    }
+
+    /// Background hops IG fires while you're already on DMs (`/`, explore,
+    /// account-linking prefetch, …). Cancel silently — never `stopLoading()`.
+    static func isIncidentalBlockedPrefetch(_ url: URL) -> Bool {
+        if isOffPlatformURL(url) { return true }
+        guard let host = url.host, allowedHosts.contains(host) else { return false }
+        let path = url.path
+        if path.isEmpty || path == "/" { return true }
+        if path == "/explore" || path.hasPrefix("/explore/") { return true }
+        if path.hasPrefix("/reels") { return true }
+        if path.contains("notifications") { return true }
+        if path.hasPrefix("/accounts/manage") { return true }
+        if path.hasPrefix("/accounts/link") { return true }
+        if path.hasPrefix("/accounts/connected") { return true }
+        if path.contains("meta") && path.hasPrefix("/accounts") { return true }
+        return false
+    }
+
+    /// Non-Instagram hosts (Facebook/Meta account sync, etc.).
+    static func isOffPlatformURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return true }
+        return !allowedHosts.contains(host)
+    }
+
+    /// `/{username}/` — the usual one-click profile escape from a DM thread.
+    static func isProfilePath(_ path: String) -> Bool {
+        let parts = path.split(separator: "/").map(String.init)
+        guard parts.count == 1 else { return false }
+        return isLikelyUsernameSegment(parts[0])
+    }
+
+    /// Blocked in-app page (profile, explore page, …) — not auth/XHR/prefetch.
+    static func isBlockedInAppChrome(_ url: URL, source: Source = .none) -> Bool {
+        if isAllowed(url, source: source) { return false }
+        if isIncidentalBlockedPrefetch(url) { return false }
+        return true
+    }
+
+    /// Main-frame document committed outside DMs — always bounce back (feed,
+    /// profile, bare `/direct` minimize shell, stories, …). Unlike
+    /// `isIncidentalBlockedPrefetch`, which only applies to cancelled background hops.
+    static func shouldRecoverFromMainDocument(_ url: URL, source: Source = .none) -> Bool {
+        guard let host = url.host, allowedHosts.contains(host) else { return true }
+        let path = url.path
+        if path.isEmpty || path == "/" { return true }
+        if path == "/direct" || path == "/direct/" { return true }
+        if isProfilePath(path) { return true }
+        if isDirectMessagingPath(path) { return false }
+        if isInAppUserSurface(path, source: source) { return false }
+        if isAllowed(url, source: source) { return false }
+        return true
+    }
+
+    /// DM surfaces the app intentionally exposes — not every `/direct/…` path.
+    /// Group-chat sender links can route to other `/direct/…` URLs that render
+    /// full Instagram; those must stay blocked. Bare `/direct` is the minimized-
+    /// messenger shell and renders full IG — not allowed.
+    static func isDirectMessagingPath(_ path: String) -> Bool {
+        if path.hasPrefix("/direct/inbox") { return true }
+        if path.hasPrefix("/direct/t/") { return true }
+        if path.hasPrefix("/direct/new") { return true }
+        return false
+    }
+
     /// Matches `path` against any of `prefixes` on a **directory boundary**.
     ///
     /// Plain `path.hasPrefix("/p")` matches `/profile/`, `/privacy/`,
@@ -146,5 +258,22 @@ enum NavigationPolicy {
         prefixes.contains { prefix in
             path == prefix || path.hasPrefix(prefix + "/")
         }
+    }
+
+    /// Reserved first path segments — not profile usernames.
+    private static let reservedTopLevelSegments: Set<String> = [
+        "direct", "accounts", "explore", "reels", "p", "tv", "stories",
+        "about", "legal", "api", "graphql", "static", "challenge",
+        "directory", "session", "nametag", "web", "developer", "privacy",
+        "terms", "lite",
+    ]
+
+    private static func isLikelyUsernameSegment(_ segment: String) -> Bool {
+        guard !segment.isEmpty,
+              !reservedTopLevelSegments.contains(segment.lowercased()) else {
+            return false
+        }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._"))
+        return segment.unicodeScalars.allSatisfy { allowed.contains($0) }
     }
 }

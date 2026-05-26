@@ -9,7 +9,6 @@ struct InstaDMApp: App {
 
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
-    @AppStorage(SettingsKey.themeID)         private var themeIDRaw    = ThemeID.sage.rawValue
     @AppStorage(SettingsKey.colorSchemePref) private var schemePrefRaw = ColorSchemePreference.system.rawValue
 
     @Environment(\.colorScheme) private var systemColorScheme
@@ -34,24 +33,24 @@ struct InstaDMApp: App {
         }
     }
 
-    // MARK: - Resolved theme state
-
-    private var themeID: ThemeID {
-        ThemeID(rawValue: themeIDRaw) ?? .sage
-    }
+    // MARK: - Resolved appearance state
 
     private var schemePref: ColorSchemePreference {
         ColorSchemePreference(rawValue: schemePrefRaw) ?? .system
     }
 
-    /// The concrete `ColorScheme` we'll resolve the palette against. Follows
-    /// the OS when the user hasn't overridden it.
+    /// The concrete `ColorScheme` to resolve the palette against. Follows
+    /// the OS when the user hasn't overridden it in Settings.
     private var resolvedScheme: ColorScheme {
         schemePref.preferredColorScheme ?? systemColorScheme
     }
 
+    /// Sage is the only palette InstaDM ships. Three-theme picking turned out
+    /// to be over-engineered for a surface this small (one Settings window
+    /// and the tab bar — the WebView is Instagram's own UI, never themed).
+    /// If you want another palette, swap the case below.
     private var palette: Palette {
-        themeID.palette(for: resolvedScheme)
+        ThemeID.sage.palette(for: resolvedScheme)
     }
 }
 

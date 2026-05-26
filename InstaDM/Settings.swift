@@ -6,22 +6,20 @@ enum NotificationLevel: String, CaseIterable {
     case off
     case badgeOnly
     case standard
-    case fullPreview
 
     var displayName: String {
         switch self {
         case .off:         return "Off"
-        case .badgeOnly:   return "Badge only"
-        case .standard:    return "Notify (no preview)"
-        case .fullPreview: return "Notify with preview (experimental)"
+        case .badgeOnly:   return "Dock badge only"
+        case .standard:    return "Banner alert"
         }
     }
 
     /// True for levels that fire OS notification banners (not just dock badges).
     var wantsBanners: Bool {
         switch self {
-        case .off, .badgeOnly:      return false
-        case .standard, .fullPreview: return true
+        case .off, .badgeOnly: return false
+        case .standard:        return true
         }
     }
 }
@@ -51,7 +49,6 @@ enum SettingsKey {
     static let notificationLevel = "notificationLevel"
     static let notificationSound = "notificationSound"
     static let pollingInterval   = "pollingInterval"
-    static let themeID           = "themeID"
     static let colorSchemePref   = "colorSchemePref"
 
     // Opt-in surfaces. Each is owned by its own feature module
@@ -60,6 +57,11 @@ enum SettingsKey {
     // same UserDefaults entry.
     static let allowFollowRequests = "allowFollowRequests"
     static let allowSharedPosts    = "allowSharedPosts"
+
+    /// When `true`, blocked link taps and `target="_blank"` hops open in the
+    /// user's default browser after login. Login/challenge flows always may
+    /// open externally regardless of this toggle.
+    static let openLinksInExternalBrowser = "openLinksInExternalBrowser"
 }
 
 // MARK: - Read interface
@@ -87,11 +89,6 @@ enum AppSettings {
         return raw > 0 ? raw : PollingInterval.normal.rawValue
     }
 
-    static var themeID: ThemeID {
-        let raw = UserDefaults.standard.string(forKey: SettingsKey.themeID) ?? ThemeID.sage.rawValue
-        return ThemeID(rawValue: raw) ?? .sage
-    }
-
     static var colorSchemePref: ColorSchemePreference {
         let raw = UserDefaults.standard.string(forKey: SettingsKey.colorSchemePref)
             ?? ColorSchemePreference.system.rawValue
@@ -107,4 +104,9 @@ enum AppSettings {
 
     static var allowFollowRequests: Bool { FollowRequests.enabled }
     static var allowSharedPosts:    Bool { SharedPosts.enabled }
+
+    /// Off after login when the user disables external link opening in Settings.
+    static var openLinksInExternalBrowser: Bool {
+        UserDefaults.standard.object(forKey: SettingsKey.openLinksInExternalBrowser) as? Bool ?? true
+    }
 }
