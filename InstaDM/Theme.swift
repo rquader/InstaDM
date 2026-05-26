@@ -7,7 +7,7 @@ import SwiftUI
 /// stays as Instagram renders it.
 ///
 /// Settings used to override these onto its window background and section
-/// labels; that was dropped in 1.0.3 in favour of macOS-native grouped Form
+/// labels; that was dropped in 1.0.0 in favour of macOS-native grouped Form
 /// styling, which handles contrast and dark-mode flips correctly without
 /// us reaching for explicit colors. The palette is now used for the tint
 /// accent only.
