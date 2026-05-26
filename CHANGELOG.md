@@ -5,6 +5,25 @@ All notable changes to this project are documented here. Dates use
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-05-25
+
+### Fixed
+- Crash on first navigation on macOS 26 (Tahoe).
+  `WKNavigationAction.request` and `WKFrameInfo.request` are imported
+  into Swift as IUO `URLRequest!`. On macOS 26 WebKit, both are
+  empirically nil for synthetic / session-restored frames during the
+  very first `decidePolicyForNavigationAction` call. The IUO bridge
+  trap (`URLRequest._unconditionallyBridgeFromObjectiveC`) crashed the
+  app with `EXC_BREAKPOINT` before any UI rendered. All three call
+  sites in `WebView.Coordinator` now optional-chain through `.request`
+  so a nil bridge falls through to a safe default. macOS 14/15 builds
+  are unaffected by the change (optional-chaining a non-nil IUO is a
+  no-op).
+- App version bumped to `1.0.1` so the new release is distinguishable
+  from the broken `1.0` build.
+
+## [1.0.0] - 2026-05-25
+
 ### Fixed
 - Requests tab no longer infinite-reloads when Instagram's
   follow-requests URL 302s into a blocked URL. `WebView.Coordinator`

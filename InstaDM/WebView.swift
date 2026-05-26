@@ -157,15 +157,25 @@ struct WebView: NSViewRepresentable {
             decidePolicyFor navigationAction: WKNavigationAction,
             decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
         ) {
-            guard let url = navigationAction.request.url else {
+            guard let url = navigationAction.safeRequest?.url else {
                 decisionHandler(.cancel)
                 return
             }
 
-            // Source frame is non-nil per the WebKit API contract but its
-            // .request.url can be nil for synthetic frames. Default to "not
-            // from a DM" when unknown — strictest interpretation, safe.
-            let sourcePath = navigationAction.sourceFrame.request.url?.path ?? ""
+            // WebKit's header declares both `WKNavigationAction.request`
+            // and `WKFrameInfo.request` as non-nullable, but on
+            // macOS 26 (Tahoe) the ObjC layer empirically hands back
+            // nil for synthetic / session-restored frames. Direct
+            // Swift access traps in
+            // `URLRequest._unconditionallyBridgeFromObjectiveC`, which
+            // crashed the app with `EXC_BREAKPOINT` on the first
+            // `decidePolicyForNavigationAction` before any UI rendered.
+            // `safeRequest` (defined at file scope below) reads the
+            // property via KVC, which returns an honestly-optional
+            // `Any?` and round-trips cleanly to `URLRequest?`. A nil
+            // source frame request falls back to "not from a DM" —
+            // strictest interpretation, safe.
+            let sourcePath = navigationAction.sourceFrame.safeRequest?.url?.path ?? ""
             let source = NavigationPolicy.Source(fromDirect: sourcePath.hasPrefix("/direct"))
 
             if NavigationPolicy.isAllowed(url, source: source) {
@@ -182,14 +192,16 @@ struct WebView: NSViewRepresentable {
 
         /// `window.open(...)` / `target="_blank"` clicks come through here.
         /// Route them to the user's default browser rather than opening a
-        /// popup inside the app.
+        /// popup inside the app. `request` goes through `safeRequest`
+        /// for the same nullability-mismatch reason as
+        /// `decidePolicyFor` above.
         func webView(
             _ webView: WKWebView,
             createWebViewWith configuration: WKWebViewConfiguration,
             for navigationAction: WKNavigationAction,
             windowFeatures: WKWindowFeatures
         ) -> WKWebView? {
-            if let url = navigationAction.request.url {
+            if let url = navigationAction.safeRequest?.url {
                 NSWorkspace.shared.open(url)
             }
             return nil
@@ -263,5 +275,46 @@ struct WebView: NSViewRepresentable {
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             lastBounceAt = nil
         }
+    }
+}
+
+// MARK: - WebKit nullability workaround
+//
+// WebKit ships its public Objective-C headers with `request` declared
+// as non-nullable on both `WKNavigationAction` and `WKFrameInfo`:
+//
+//     @property (nonatomic, readonly, copy) NSURLRequest *request;
+//
+// (no `nullable`, and the surrounding `NS_ASSUME_NONNULL_BEGIN` makes
+// the absence of an annotation imply non-null). Swift therefore
+// imports it as plain `URLRequest`, which means dot-access compiles
+// without an optional but goes through
+// `URLRequest._unconditionallyBridgeFromObjectiveC` at runtime — and
+// that bridge traps with `EXC_BREAKPOINT` when the underlying ObjC
+// pointer is nil.
+//
+// On macOS 26 (Tahoe) the runtime *does* hand back nil for synthetic
+// frames during the very first `decidePolicyForNavigationAction`,
+// crashing the app on launch before any UI renders. The header
+// annotation is, in practice, wrong for that case.
+//
+// The cleanest workaround that doesn't require an ObjC bridge file:
+// read the property through KVC (`value(forKey:)`), which returns
+// `Any?` regardless of the property's declared nullability and lets
+// us cast to `URLRequest?` honestly.
+
+private extension WKNavigationAction {
+    /// `request`, read via KVC so a runtime-nil value doesn't trap
+    /// the IUO bridge. Use this instead of the direct property.
+    var safeRequest: URLRequest? {
+        (self as NSObject).value(forKey: "request") as? URLRequest
+    }
+}
+
+private extension WKFrameInfo {
+    /// `request`, read via KVC so a runtime-nil value doesn't trap
+    /// the IUO bridge. Use this instead of the direct property.
+    var safeRequest: URLRequest? {
+        (self as NSObject).value(forKey: "request") as? URLRequest
     }
 }
