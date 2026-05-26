@@ -5,17 +5,7 @@ All notable changes to this project are documented here. Dates use
 
 ## [Unreleased]
 
-## [1.0.1] - 2026-05-26
-
-### Fixed
-- GitHub Release `.app` failed login while a local Xcode build worked.
-  CI built with `CODE_SIGNING_ALLOWED=NO`, which left a linker-adhoc binary
-  with **no embedded entitlements** (`app-sandbox`, `network.client`). Local
-  Xcode automatic signing applied them; the downloaded zip did not. The
-  release workflow now ad-hoc signs the built `.app` with
-  `InstaDM.entitlements` before zipping.
-
-## [1.0.0] - 2026-05-25
+## [1.0.0] - 2026-05-26
 
 First public release. InstaDM is a native macOS app for Instagram direct
 messages only — no feed, reels tab, explore, or stories.
@@ -36,8 +26,9 @@ messages only — no feed, reels tab, explore, or stories.
   module).
 - **macOS 14+**, tested through macOS 26 (Tahoe), including first-
   navigation crash and login-handoff fixes.
-- **Distribution** — unsigned `InstaDM.app.zip` on GitHub Releases.
-  First launch: right-click → Open, or
+- **Distribution** — ad-hoc signed `InstaDM.app.zip` on GitHub Releases
+  (embeds `app-sandbox` + `network.client` entitlements). First launch:
+  right-click → Open, or
   `xattr -dr com.apple.quarantine /Applications/InstaDM.app`.
 
 ### Intentional behavior
