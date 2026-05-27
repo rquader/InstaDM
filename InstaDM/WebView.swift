@@ -15,14 +15,27 @@ struct WebView: NSViewRepresentable {
     /// blocked JS-driven navigation needs a home.
     let startURL: URL
 
+    /// Per-tab JS-guard allowlist. The document-start guard blocks anchor
+    /// clicks and `history.pushState`/`replaceState` to any path outside
+    /// this list (merged with the always-on auth/internal prefixes). The
+    /// Messages tab passes DM paths; the Requests tab passes only the
+    /// follow-requests path — so you can't click out of the Requests tab
+    /// into DMs, the feed, or a profile.
+    let allowedPathPrefixes: [String]
+
     /// When `true`, this web view registers with `NotificationManager` to
     /// drive the dock badge and notification banners off its
     /// `document.title`. Only the Messages tab does this — the Requests
     /// tab's title isn't the unread-count source of truth.
     let tracksNotifications: Bool
 
-    init(startURL: URL = NavigationPolicy.inboxURL, tracksNotifications: Bool = true) {
+    init(
+        startURL: URL = NavigationPolicy.inboxURL,
+        allowedPathPrefixes: [String] = NavigationPolicy.jsMessagesTabAllowedPathPrefixes,
+        tracksNotifications: Bool = true
+    ) {
         self.startURL = startURL
+        self.allowedPathPrefixes = allowedPathPrefixes
         self.tracksNotifications = tracksNotifications
     }
 
@@ -33,15 +46,34 @@ struct WebView: NSViewRepresentable {
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .default()  // persistent cookies
-        configuration.userContentController.addUserScript(Self.spaNavigationGuardJS)
-        configuration.userContentController.addUserScript(Self.cosmeticHideNavCSS)
-        configuration.userContentController.add(
-            context.coordinator,
-            name: Self.authHandoffMessageHandler
+
+        // Present a complete Safari user agent. WKWebView's stock UA omits the
+        // trailing "Version/<v> Safari/<build>" tokens, and Instagram's login
+        // endpoint treats that truncated UA as an unsupported / automated
+        // client — the login request then never completes (the spinner circles
+        // forever). The exact same fresh login works in real Safari, which
+        // sends the full token. `applicationNameForUserAgent` appends to the
+        // stock WebKit UA, producing a normal macOS Safari string — *more*
+        // Safari-like than the default, not less, so it doesn't raise the
+        // "unusual UA" ban risk noted in the project's risk docs.
+        configuration.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
+
+        configuration.userContentController.addUserScript(
+            Self.spaNavigationGuardScript(allowedPathPrefixes: allowedPathPrefixes)
         )
+        configuration.userContentController.addUserScript(Self.cosmeticHideNavCSS)
+        #if DEBUG
+        configuration.userContentController.add(context.coordinator, name: "instaDMDiag")
+        configuration.userContentController.addUserScript(Self.diagnosticScript)
+        #endif
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
-        context.coordinator.webView = webView
+        #if DEBUG
+        // Debug builds only: lets you attach Safari Web Inspector
+        // (Develop → your Mac → InstaDM) to watch the Console / Network during
+        // a repro. Release builds are never inspectable.
+        if #available(macOS 13.3, *) { webView.isInspectable = true }
+        #endif
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = false
@@ -66,14 +98,11 @@ struct WebView: NSViewRepresentable {
         if coordinator.tracksNotifications {
             NotificationManager.shared.detach(forWebView: nsView)
         }
-        nsView.configuration.userContentController.removeScriptMessageHandler(
-            forName: authHandoffMessageHandler
-        )
+        coordinator.stopAuthWatch()
+        #if DEBUG
+        nsView.configuration.userContentController.removeScriptMessageHandler(forName: "instaDMDiag")
+        #endif
     }
-
-    /// JS → Swift bridge name for post-login SPA handoff (must match the
-    /// string in `spaNavigationGuardJS`).
-    private static let authHandoffMessageHandler = "instaDMAuthHandoff"
 
     // MARK: - SPA navigation guard
 
@@ -103,67 +132,70 @@ struct WebView: NSViewRepresentable {
     ///      bundle reads `history.pushState` AFTER us, so it gets the
     ///      wrapped version.
     ///
-    /// Allowed prefixes mirror `NavigationPolicy.isDirectMessagingPath` +
-    /// the auth / internal allowlist. **These two lists will drift if you
-    /// only update one side** — update this script whenever you touch the
-    /// Swift allowlist.
+    /// `allowedPathPrefixes` is the per-tab surface (Messages → DM paths,
+    /// Requests → the follow-requests path); the always-on auth / internal
+    /// prefixes are merged in from `NavigationPolicy.jsCommonAllowedPathPrefixes`.
+    /// The JS allowlist mirrors the Swift one — keep them in sync if you add
+    /// a surface.
     ///
-    /// Side effect: clicking the messenger's "minimize" button no-ops.
-    /// URL stays on the thread, the feed never gets to render underneath.
-    /// That matches the DM-only product intent — minimizing into a feed
-    /// is exactly the leak this app exists to prevent.
+    /// **Stands down on auth surfaces.** While `location.pathname` matches an
+    /// auth prefix (`NavigationPolicy.authSurfacePathPrefixes` → login /
+    /// recovery / challenge), both the click listener and the history wrappers
+    /// no-op so Instagram's real login flow runs completely untouched. The
+    /// Swift-side cookie watcher (`startAuthWatch`) routes to the inbox once a
+    /// session exists. Trying to intercept the post-login navigation in JS or
+    /// Swift is what broke login repeatedly — so we simply don't.
     ///
-    /// Post-login handoff: Instagram often `pushState`s to `/` or `/direct`
-    /// after credentials commit. Block those (feed/minimize shell) but ping
-    /// Swift via `webkit.messageHandlers` so it can wait for `sessionid`
-    /// before loading `/direct/inbox/` — never `location.replace` early.
-    private static let spaNavigationGuardJS: WKUserScript = {
-        let handoffHandler = authHandoffMessageHandler
+    /// Side effect: clicking the messenger's "minimize" button no-ops (its
+    /// pushState target `/` or `/direct` is outside the allowlist and not an
+    /// auth path), so the feed never renders under an open thread.
+    private static func spaNavigationGuardScript(
+        allowedPathPrefixes: [String]
+    ) -> WKUserScript {
+        func jsonArray(_ items: [String]) -> String {
+            guard let data = try? JSONSerialization.data(withJSONObject: items),
+                  let json = String(data: data, encoding: .utf8) else {
+                return "[]"
+            }
+            return json
+        }
+        let allowedJSON = jsonArray(NavigationPolicy.jsCommonAllowedPathPrefixes + allowedPathPrefixes)
+        let authJSON = jsonArray(NavigationPolicy.authSurfacePathPrefixes)
         let source = """
         (function() {
             if (window.__InstaDMNavGuard) { return; }
-            window.__InstaDMNavGuard = true;
+
+            var ALLOWED_PREFIXES = \(allowedJSON);
+            var AUTH_PREFIXES = \(authJSON);
+
+            function matchesPrefix(path, list) {
+                if (!path) { return false; }
+                for (var i = 0; i < list.length; i++) {
+                    if (path.indexOf(list[i]) === 0) { return true; }
+                }
+                return false;
+            }
 
             function pathAllowed(path) {
-                if (!path) { return false; }
-                return (
-                    path.indexOf('/direct/inbox') === 0
-                    || path.indexOf('/direct/t/') === 0
-                    || path.indexOf('/direct/new') === 0
-                    || path.indexOf('/accounts/login') === 0
-                    || path.indexOf('/accounts/onetap') === 0
-                    || path.indexOf('/accounts/password') === 0
-                    || path.indexOf('/accounts/signup') === 0
-                    || path.indexOf('/accounts/emailsignup') === 0
-                    || path.indexOf('/accounts/check_email') === 0
-                    || path.indexOf('/accounts/logout') === 0
-                    || path.indexOf('/accounts/confirm') === 0
-                    || path.indexOf('/accounts/access') === 0
-                    || path.indexOf('/accounts/account_recovery') === 0
-                    || path.indexOf('/accounts/username') === 0
-                    || path.indexOf('/accounts/two_factor') === 0
-                    || path.indexOf('/challenge') === 0
-                    || path.indexOf('/api') === 0
-                    || path.indexOf('/graphql') === 0
-                    || path.indexOf('/ajax') === 0
-                    || path.indexOf('/static') === 0
-                );
+                return matchesPrefix(path, ALLOWED_PREFIXES);
             }
 
-            function isAuthPath(path) {
-                if (!path) { return false; }
-                return path.indexOf('/accounts/') === 0
-                    || path.indexOf('/challenge') === 0;
+            // Auth paths only — /accounts/activity (FollowRequests) is not
+            // auth, so the guard stays active there.
+            function isAuthContext() {
+                return matchesPrefix(location.pathname || '/', AUTH_PREFIXES);
             }
 
-            /// Post-login SPA hops that would render the feed if allowed.
-            function authHandoffTarget(path) {
-                if (path === '/' || path === ''
-                    || path === '/direct' || path === '/direct/') {
-                    return '/direct/inbox/';
-                }
-                return null;
-            }
+            // CRITICAL: do not install the guard at all on a login / challenge
+            // surface. Instagram's fresh-login flow needs a pristine JS
+            // environment — native history.pushState, no injected capture-phase
+            // click listeners — which is exactly what Safari gives it (where
+            // fresh login works). Wrapping history on the login page stalls
+            // Instagram's login request. This script re-runs on every new
+            // document, so the guard reactivates the instant we're off auth.
+            if (isAuthContext()) { return; }
+
+            window.__InstaDMNavGuard = true;
 
             function resolvePath(href) {
                 if (!href || typeof href !== 'string') { return null; }
@@ -191,6 +223,7 @@ struct WebView: NSViewRepresentable {
             }
 
             function clickHandler(e) {
+                if (isAuthContext()) { return; }
                 var t = e.target;
                 if (!t || !t.closest) { return; }
                 var a = t.closest('a[href]');
@@ -210,16 +243,10 @@ struct WebView: NSViewRepresentable {
                     return;
                 }
                 var wrapped = function(state, title, url) {
-                    if (typeof url === 'string' && url.length > 0) {
+                    if (!isAuthContext()
+                        && typeof url === 'string' && url.length > 0) {
                         var path = resolvePath(url);
                         if (path !== null && !pathAllowed(path)) {
-                            var current = location.pathname || '/';
-                            if (isAuthPath(current) && authHandoffTarget(path) !== null) {
-                                try {
-                                    window.webkit.messageHandlers.\(handoffHandler).postMessage('postLogin');
-                                } catch (e) { /* no handler yet */ }
-                                return undefined;
-                            }
                             return undefined;
                         }
                     }
@@ -237,7 +264,7 @@ struct WebView: NSViewRepresentable {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
-    }()
+    }
 
     // MARK: - Cosmetic CSS
 
@@ -262,6 +289,19 @@ struct WebView: NSViewRepresentable {
     /// navigation allowlist is the actual defense.
     private static let cosmeticHideNavCSS: WKUserScript = {
         let css = """
+        /* Kill Instagram's entire primary nav rail — icons AND the
+           hover-expanded text labels (Search, Explore, Reels, Messages,
+           Notifications, Create, Profile, More). :has() targets the rail by
+           the Instagram logo / home link it contains; the messenger's own
+           thread list is not inside this rail, so it's untouched. WebKit
+           supports :has() on macOS 14+. This is the primary hide; the
+           per-item selectors below are a fallback for DOM shapes where the
+           rail isn't a single nav landmark. */
+        nav:has(a[href='/']:not([href*='direct'])),
+        [role='navigation']:has(a[href='/']:not([href*='direct'])) {
+            display: none !important;
+        }
+
         /* Anchor targets — language-independent */
         a[href='/']:not([href*='direct']),
         a[href^='/explore/'],
@@ -346,11 +386,83 @@ struct WebView: NSViewRepresentable {
         return String(json.dropFirst().dropLast())
     }
 
+#if DEBUG
+    // MARK: - Login diagnostics (DEBUG only)
+
+    /// Temporary instrumentation to diagnose the fresh-login failure without a
+    /// Safari Web Inspector. Injected at documentStart on every page; observes
+    /// (never modifies) the login request and posts a one-line summary to Swift,
+    /// which `NSLog`s it as `[InstaDM/page] …` in Xcode's console.
+    ///
+    /// Logs **URLs and HTTP status codes only** — never request/response bodies,
+    /// so credentials are never captured. Compiled out of Release entirely.
+    private static let diagnosticScript: WKUserScript = {
+        let source = """
+        (function() {
+            if (window.__InstaDMDiag) { return; }
+            window.__InstaDMDiag = true;
+            function post(m) {
+                try {
+                    window.webkit.messageHandlers.instaDMDiag.postMessage(String(m).slice(0, 500));
+                } catch (e) {}
+            }
+            post('doc ' + location.pathname + ' ready=' + document.readyState);
+            window.addEventListener('error', function(e) {
+                post('js-error: ' + (e.message || '') + ' @' + (e.lineno || ''));
+            });
+            window.addEventListener('unhandledrejection', function(e) {
+                var r = e.reason;
+                post('reject: ' + ((r && r.message) ? r.message : String(r)));
+            });
+            function watched(u) {
+                return u.indexOf('login') !== -1 || u.indexOf('/accounts/') !== -1;
+            }
+            var of = window.fetch;
+            if (typeof of === 'function') {
+                window.fetch = function(input) {
+                    var url = '';
+                    try { url = (input && input.url) ? input.url : String(input); } catch (e) {}
+                    var w = watched(url);
+                    if (w) { post('fetch-> ' + url); }
+                    return of.apply(this, arguments).then(function(r) {
+                        if (w) { post('fetch<- ' + r.status + ' ' + url); }
+                        return r;
+                    }, function(err) {
+                        if (w) { post('fetch-x ' + (err && err.message) + ' ' + url); }
+                        throw err;
+                    });
+                };
+            }
+            var oOpen = XMLHttpRequest.prototype.open;
+            var oSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                try { this.__diagUrl = url; this.__diagMethod = method; } catch (e) {}
+                return oOpen.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function() {
+                var u = this.__diagUrl || '';
+                if (watched(u)) {
+                    post('xhr-> ' + (this.__diagMethod || '') + ' ' + u);
+                    var self = this;
+                    this.addEventListener('loadend', function() {
+                        post('xhr<- ' + self.status + ' ' + u);
+                    });
+                }
+                return oSend.apply(this, arguments);
+            };
+        })();
+        """
+        return WKUserScript(
+            source: source,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+    }()
+#endif
+
     // MARK: - Coordinator
 
-    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-
-        weak var webView: WKWebView?
+    final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate {
 
         /// The URL this coordinator rebounds blocked JS-driven navigations
         /// to. For Messages it's the inbox; for Requests it's the follow-
@@ -374,14 +486,20 @@ struct WebView: NSViewRepresentable {
 
         private let recoveryDebounce: TimeInterval = 0.12
 
-        /// Set when the user submits credentials; post-login blocked redirects
-        /// are only allowed inside this window so idle prefetch on the login
-        /// page doesn't trigger a premature inbox load.
-        private var authSubmitAt: Date?
+        /// Cookie-driven login watcher (see `startAuthWatch`). Replaces the
+        /// old `authSubmitAt` / `awaitingInboxHandoff` / JS-handoff-message
+        /// machinery. Rather than guess how Instagram navigates after login
+        /// (form submit vs. fetch vs. pushState vs. in-place render — each
+        /// version differs, and guessing wrong is what kept breaking login),
+        /// we poll the cookie store while on an auth surface and load the
+        /// inbox the moment a `sessionid` exists.
+        private var authWatchActive = false
 
-        /// Set when we deliberately allowed a post-login redirect to a blocked
-        /// URL so `didFinish` can route to the inbox once `sessionid` exists.
-        private var awaitingInboxHandoff = false
+        /// Bumped on every start/stop so a stale in-flight poll callback
+        /// no-ops instead of resuming a watch we already finished.
+        private var authWatchGeneration = 0
+
+        private let maxAuthWatchAttempts = 900  // ~6 min at 0.4s
 
         /// True after the first successful inbox/thread load. Guards scroll-only
         /// optimizations so they never interfere with cold launch.
@@ -438,8 +556,8 @@ struct WebView: NSViewRepresentable {
                 // KVC can return nil during login AJAX on macOS 26. Allow only
                 // in auth context — a global allow lets profile/feed URLs load
                 // and stay in the web view (full Instagram access).
-                if isAuthSource(navigationAction) || isOnAuthSurface(webView) {
-                    authSubmitAt = Date()
+                if isOnAuthSurface(webView) || isAuthSource(navigationAction) {
+                    startAuthWatch(in: webView)
                     decisionHandler(.allow)
                     return
                 }
@@ -448,18 +566,15 @@ struct WebView: NSViewRepresentable {
             }
 
             // WebKit's header declares both `WKNavigationAction.request`
-            // and `WKFrameInfo.request` as non-nullable, but on
-            // macOS 26 (Tahoe) the ObjC layer empirically hands back
-            // nil for synthetic / session-restored frames. Direct
-            // Swift access traps in
-            // `URLRequest._unconditionallyBridgeFromObjectiveC`, which
-            // crashed the app with `EXC_BREAKPOINT` on the first
+            // and `WKFrameInfo.request` as non-nullable, but on macOS 26
+            // (Tahoe) the ObjC layer empirically hands back nil for
+            // synthetic / session-restored frames. Direct Swift access
+            // traps in `URLRequest._unconditionallyBridgeFromObjectiveC`,
+            // which crashed the app with `EXC_BREAKPOINT` on the first
             // `decidePolicyForNavigationAction` before any UI rendered.
-            // `safeRequest` (defined at file scope below) reads the
-            // property via KVC, which returns an honestly-optional
-            // `Any?` and round-trips cleanly to `URLRequest?`. A nil
-            // source frame request falls back to "not from a DM" —
-            // strictest interpretation, safe.
+            // `safeRequest` (file scope below) reads the property via KVC,
+            // returning an honestly-optional `Any?`. A nil source frame
+            // request falls back to "not from a DM" — strictest, safe.
             let sourcePath = navigationAction.sourceFrame.safeRequest?.url?.path ?? ""
             let source = NavigationPolicy.Source(
                 fromDirect: NavigationPolicy.isDirectMessagingPath(sourcePath)
@@ -470,17 +585,27 @@ struct WebView: NSViewRepresentable {
                 "url=\(url.absoluteString) wv=\(webView.url?.absoluteString ?? "nil") type=\(navigationAction.navigationType.rawValue) src=\(sourcePath.isEmpty ? "nil" : sourcePath) inDMSession=\(isInDMSession(webView)) settled=\(hasSettledOnUserSurface)"
             )
 
+            // AUTH FLOW: stand down. While the web view is showing a login /
+            // challenge surface (or the navigation originated from one), allow
+            // every navigation so Instagram's real auth flow — AJAX login,
+            // one-tap, 2FA, the post-login hop to the feed — runs untouched.
+            // The cookie watcher routes to the inbox the moment a session
+            // exists. Second-guessing IG's post-login navigation here is what
+            // broke login repeatedly.
             if isOnAuthSurface(webView) || isAuthSource(navigationAction) {
-                noteAuthSubmit(navigationAction, url: url)
+                startAuthWatch(in: webView)
+                dlog("decideAction.authAllow", "url=\(url.absoluteString)")
+                decisionHandler(.allow)
+                return
             }
 
+            // From here down we are NOT on an auth surface — normal DM-only policy.
             if NavigationPolicy.isAllowed(url, source: source) {
-                if !isOnAuthSurface(webView),
-                   !isAuthSource(navigationAction),
-                   !NavigationPolicy.isInAppUserSurface(url.path, source: source) {
+                if !NavigationPolicy.isInAppUserSurface(url.path, source: source) {
+                    // Allowed-but-not-a-surface (an /api or /graphql doc trying
+                    // to become the main frame). Cancel — but don't stopLoading();
+                    // that aborts pagination XHR while scrolling thread history.
                     decisionHandler(.cancel)
-                    // Still on DMs — don't stopLoading(); that aborts pagination
-                    // XHR and other in-flight requests while scrolling history.
                     return
                 }
                 // Open threads only: IG sometimes re-navigates the same thread
@@ -512,31 +637,7 @@ struct WebView: NSViewRepresentable {
                 return
             }
 
-            // Post-login 302s target blocked URLs (`/`, etc.). Allow the response
-            // to commit Set-Cookie, then route to inbox in `didFinish` once a
-            // session cookie exists. Use source-frame auth detection — during
-            // redirects `webView.url` is often still nil/stale, which is why
-            // checking only `isOnAuthSurface(webView)` brought the spinner back.
-            if navigationAction.navigationType != .linkActivated,
-               shouldAllowAuthRedirect(
-                   webView,
-                   navigationAction: navigationAction,
-                   url: url
-               ) {
-                if authSubmitAt == nil { authSubmitAt = Date() }
-                awaitingInboxHandoff = true
-                decisionHandler(.allow)
-                return
-            }
-
             decisionHandler(.cancel)
-
-            // Mid-login blocked hops (prefetch, XHR-as-navigation, etc.) must
-            // not bounce to inbox — that loads /direct/inbox without a session
-            // cookie and Instagram sends the user straight back to login.
-            if isOnAuthSurface(webView) || isAuthSource(navigationAction) {
-                return
-            }
 
             if isViewingInAppUserSurface(webView) {
                 handleBlockedWhileOnDMs(
@@ -572,16 +673,13 @@ struct WebView: NSViewRepresentable {
 
             dlog(
                 "decideResponse.in",
-                "url=\(url.absoluteString) wv=\(webView.url?.absoluteString ?? "nil") awaitingInboxHandoff=\(awaitingInboxHandoff)"
+                "url=\(url.absoluteString) wv=\(webView.url?.absoluteString ?? "nil") onAuth=\(isOnAuthSurface(webView))"
             )
 
-            if awaitingInboxHandoff {
-                let path = url.path
-                if path.isEmpty || path == "/" {
-                    decisionHandler(.allow)
-                    return
-                }
-                decisionHandler(.cancel)
+            // AUTH FLOW: let login pages and the post-login feed hop commit.
+            // The cookie watcher routes to the inbox once a session exists.
+            if isOnAuthSurface(webView) {
+                decisionHandler(.allow)
                 return
             }
 
@@ -658,11 +756,7 @@ struct WebView: NSViewRepresentable {
             if let currentURL = webView.url,
                NavigationPolicy.isAllowed(currentURL),
                NavigationPolicy.isInAppUserSurface(currentURL.path) {
-                // Only after the user actually submitted credentials — not on
-                // every blocked prefetch while the login form is idle.
-                if isOnAuthSurface(webView), authSubmitAt != nil {
-                    routeToInboxWhenAuthenticated(in: webView)
-                }
+                // Already on an allowed surface; cancelling the nav is enough.
                 return
             }
             if webView.url == nil {
@@ -758,7 +852,6 @@ struct WebView: NSViewRepresentable {
             navigationAction: WKNavigationAction? = nil
         ) -> Bool {
             if isOnAuthSurface(webView) { return true }
-            if awaitingInboxHandoff { return true }
             if let navigationAction, isAuthSource(navigationAction) { return true }
             return AppSettings.openLinksInExternalBrowser
         }
@@ -777,15 +870,17 @@ struct WebView: NSViewRepresentable {
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
             guard let url = webView.url else { return }
 
-            // Post-login `/` may commit before didFinish; never stopLoading here
-            // or Set-Cookie may not land. didFinish + routeToInboxWhenAuthenticated
-            // owns the handoff. (Fresh login has hasSettledOnUserSurface == false,
-            // so this must not be gated on that flag.)
-            if awaitingInboxHandoff { return }
+            // On a login / challenge surface — keep the cookie watcher armed
+            // and don't touch the page. It routes to the inbox once a session
+            // lands.
+            if isOnAuthSurface(webView) {
+                startAuthWatch(in: webView)
+                return
+            }
 
+            // Scroll/heal recovery only kicks in after the first settled DM
+            // load; during cold launch / login it stays out of the way.
             guard hasSettledOnUserSurface else { return }
-
-            if isOnAuthSurface(webView) { return }
 
             let path = url.path
             let source = NavigationPolicy.Source(
@@ -898,20 +993,25 @@ struct WebView: NSViewRepresentable {
                 "wv=\(current.absoluteString) onAuth=\(isOnAuthSurface(webView)) settled=\(hasSettledOnUserSurface) needsHeal=\(surfaceNeedsHeal) restoring=\(isRestoringDMSurface) lastDMSurface=\(lastDMSurfaceURL?.absoluteString ?? "nil")"
             )
 
-            // AJAX login often keeps the auth URL while Set-Cookie lands — poll
-            // for session cookies after submit even if no redirect/pushState fired.
-            if isOnAuthSurface(webView), authSubmitAt != nil {
-                routeToInboxWhenAuthenticated(in: webView)
+            // AUTH FLOW: keep the cookie watcher running; it owns routing to
+            // the inbox once a session lands. Never bounce to the inbox from
+            // here — loading /direct/inbox/ before Set-Cookie commits lands
+            // the user straight back on the login page.
+            if isOnAuthSurface(webView) {
+                startAuthWatch(in: webView)
                 lastCommittedPath = current.path
                 return
             }
 
             if NavigationPolicy.isAllowed(current) {
                 let path = current.path
-                let fromDirect = NavigationPolicy.isDirectMessagingPath(path)
-                let source = NavigationPolicy.Source(fromDirect: fromDirect)
-                if !isOnAuthSurface(webView),
-                   !NavigationPolicy.isInAppUserSurface(path, source: source) {
+                let source = NavigationPolicy.Source(
+                    fromDirect: NavigationPolicy.isDirectMessagingPath(path)
+                )
+
+                // Allowed-but-not-a-surface (an /api or /graphql doc as the
+                // main frame). Recover to a DM surface unless already settled.
+                if !NavigationPolicy.isInAppUserSurface(path, source: source) {
                     if hasSettledOnUserSurface {
                         lastCommittedPath = path
                         return
@@ -922,40 +1022,32 @@ struct WebView: NSViewRepresentable {
                     return
                 }
 
-                if !isOnAuthSurface(webView),
-                   shouldRestoreDMSurface(landingOn: path) {
+                if shouldRestoreDMSurface(landingOn: path) {
                     restoreDMSurface(in: webView, url: current)
                     return
                 }
+                if isRestoringDMSurface { isRestoringDMSurface = false }
 
-                if isRestoringDMSurface {
-                    isRestoringDMSurface = false
-                }
-
-                if !isOnAuthSurface(webView) {
-                    awaitingInboxHandoff = false
-                    if NavigationPolicy.isDirectMessagingPath(path),
-                       !hasSettledOnUserSurface {
-                        routeToInboxWhenAuthenticated(in: webView)
-                        lastCommittedPath = path
-                        return
-                    }
-                    authSubmitAt = nil
-                    markSettledOnUserSurface(from: current)
-                }
+                // Settled on a real user surface — login (if any) is complete.
+                stopAuthWatch()
+                markSettledOnUserSurface(from: current)
                 lastCommittedPath = path
                 return
             }
 
-            // Landed on a blocked surface (profile, feed, explore, …).
+            // Landed on a blocked surface (feed, profile, …).
             dlog(
                 "didFinish.blocked",
-                "wv=\(current.absoluteString) target=\((lastDMSurfaceURL ?? homeURL).absoluteString) awaitingInboxHandoff=\(awaitingInboxHandoff)"
+                "wv=\(current.absoluteString) settled=\(hasSettledOnUserSurface)"
             )
             markSurfaceCompromised()
-            if awaitingInboxHandoff {
-                awaitingInboxHandoff = false
-                routeToInboxWhenAuthenticated(in: webView)
+
+            // Before the user has ever settled on a DM surface, a blocked
+            // landing is almost always the post-login feed hop. Don't bounce
+            // blindly — let the cookie watcher route once a session is
+            // confirmed, so we never reload /direct/inbox/ ahead of Set-Cookie.
+            if !hasSettledOnUserSurface {
+                startAuthWatch(in: webView)
                 lastCommittedPath = current.path
                 return
             }
@@ -1007,45 +1099,84 @@ struct WebView: NSViewRepresentable {
             }
         }
 
-        private func noteAuthSubmit(_ navigationAction: WKNavigationAction, url: URL) {
-            if navigationAction.navigationType == .formSubmitted {
-                authSubmitAt = Date()
+        // MARK: - Auth watch (cookie-driven login completion)
+
+        /// Arm the cookie watcher. Idempotent.
+        ///
+        /// Instagram's login can complete via a full navigation, a server
+        /// 302, an SPA `pushState`, or an in-place React render — and which
+        /// one happens varies by build. Rather than detect the post-login
+        /// navigation (the approach that broke login repeatedly), we poll the
+        /// cookie store while on an auth surface: the moment a `sessionid`
+        /// exists and we're not already on a DM surface, load the inbox. One
+        /// mechanism, no shared flags, independent of how IG navigates.
+        private func startAuthWatch(in webView: WKWebView) {
+            guard !authWatchActive else { return }
+            authWatchActive = true
+            authWatchGeneration &+= 1
+            dlog("authWatch.start", "wv=\(webView.url?.absoluteString ?? "nil")")
+            pollAuthCookies(in: webView, generation: authWatchGeneration, attempt: 0)
+        }
+
+        func stopAuthWatch() {
+            guard authWatchActive else { return }
+            authWatchActive = false
+            authWatchGeneration &+= 1
+            dlog("authWatch.stop")
+        }
+
+        private func pollAuthCookies(in webView: WKWebView, generation: Int, attempt: Int) {
+            guard authWatchActive, generation == authWatchGeneration else { return }
+
+            // Already on a DM surface — login finished, nothing to route.
+            if let url = webView.url, NavigationPolicy.isDirectMessagingPath(url.path) {
+                stopAuthWatch()
                 return
             }
-            guard navigationAction.safeRequest?.httpMethod == "POST" else { return }
-            let path = url.path
-            if path.hasPrefix("/accounts/login") || path.contains("/accounts/login/") {
-                authSubmitAt = Date()
+
+            let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+            cookieStore.getAllCookies { [weak self, weak webView] cookies in
+                // WKHTTPCookieStore delivers on the main thread; hop anyway to
+                // be defensive about future WebKit changes.
+                DispatchQueue.main.async {
+                    guard let self, let webView else { return }
+                    guard self.authWatchActive,
+                          generation == self.authWatchGeneration else { return }
+
+                    let hasSession = cookies.contains { cookie in
+                        guard cookie.domain.contains("instagram"),
+                              !cookie.value.isEmpty else { return false }
+                        return cookie.name == "sessionid"
+                    }
+
+                    if hasSession {
+                        self.dlog("authWatch.session", "wv=\(webView.url?.absoluteString ?? "nil")")
+                        self.stopAuthWatch()
+                        if let url = webView.url,
+                           NavigationPolicy.isDirectMessagingPath(url.path) {
+                            self.markSettledOnUserSurface(from: url)
+                        } else {
+                            webView.load(URLRequest(url: self.homeURL))
+                        }
+                        return
+                    }
+
+                    // No session yet — keep polling. Capped so an abandoned
+                    // login page eventually stops (re-armed on the next auth
+                    // commit if the user returns).
+                    guard attempt < self.maxAuthWatchAttempts else {
+                        self.stopAuthWatch()
+                        return
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        self.pollAuthCookies(
+                            in: webView,
+                            generation: generation,
+                            attempt: attempt + 1
+                        )
+                    }
+                }
             }
-        }
-
-        private func shouldAllowAuthRedirect(
-            _ webView: WKWebView,
-            navigationAction: WKNavigationAction,
-            url: URL
-        ) -> Bool {
-            guard navigationAction.navigationType != .linkActivated else { return false }
-            guard isOnAuthSurface(webView)
-                || isAuthSource(navigationAction)
-                || authSubmitAt != nil else {
-                return false
-            }
-            let path = url.path
-            // Post-login 302 through feed root only — inbox load waits for cookies.
-            return path.isEmpty || path == "/"
-        }
-
-        // MARK: - JS auth handoff
-
-        func userContentController(
-            _ userContentController: WKUserContentController,
-            didReceive message: WKScriptMessage
-        ) {
-            guard message.name == WebView.authHandoffMessageHandler else { return }
-            authSubmitAt = authSubmitAt ?? Date()
-            awaitingInboxHandoff = true
-            guard let webView else { return }
-            routeToInboxWhenAuthenticated(in: webView)
         }
 
         /// True when the user is viewing DMs — uses source frame **or** the
@@ -1068,51 +1199,35 @@ struct WebView: NSViewRepresentable {
             let sourcePath = navigationAction.sourceFrame.safeRequest?.url?.path ?? ""
             let sourceHost = navigationAction.sourceFrame.safeRequest?.url?.host ?? ""
             if sourceHost == "accounts.instagram.com" { return true }
-            return sourcePath.hasPrefix("/accounts")
-                || sourcePath.hasPrefix("/challenge")
+            return NavigationPolicy.isAuthSurfacePath(sourcePath)
         }
 
-        /// Loads `homeURL` only after Instagram's `sessionid` cookie is visible.
-        /// Loading the inbox without it produces the empty-login flash.
-        private func routeToInboxWhenAuthenticated(in webView: WKWebView, attempt: Int = 0) {
-            let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
-            cookieStore.getAllCookies { [homeURL] cookies in
-                let hasSession = cookies.contains { cookie in
-                    guard cookie.domain.contains("instagram"), !cookie.value.isEmpty else {
-                        return false
-                    }
-                    return cookie.name == "sessionid" || cookie.name == "ds_user_id"
-                }
-                DispatchQueue.main.async {
-                    if hasSession {
-                        self.authSubmitAt = nil
-                        self.awaitingInboxHandoff = false
-                        if let current = webView.url,
-                           NavigationPolicy.isAllowed(current),
-                           NavigationPolicy.isDirectMessagingPath(current.path) {
-                            self.markSettledOnUserSurface(from: current)
-                            return
-                        }
-                        webView.load(URLRequest(url: homeURL))
-                        return
-                    }
-                    guard attempt < 30 else { return }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                        self.routeToInboxWhenAuthenticated(in: webView, attempt: attempt + 1)
-                    }
-                }
-            }
-        }
-
-        /// True when the web view is mid-login or mid-challenge.
+        /// True when the web view is mid-login or mid-challenge — a real auth
+        /// surface only. Deliberately **not** every `/accounts/*` path:
+        /// `/accounts/activity` is the opt-in FollowRequests surface, not an
+        /// auth page, so it must not trip the auth stand-down (which would
+        /// disarm the DM-only guard on the Requests tab).
         private func isOnAuthSurface(_ webView: WKWebView) -> Bool {
             guard let current = webView.url else { return false }
             if current.host == "accounts.instagram.com" { return true }
-            let path = current.path
-            return path.hasPrefix("/accounts") || path.hasPrefix("/challenge")
+            return NavigationPolicy.isAuthSurfacePath(current.path)
         }
     }
 }
+
+#if DEBUG
+// Receives the login-diagnostics messages and prints them to Xcode's console
+// as `[InstaDM/page] …`. DEBUG only; the handler is never registered in Release.
+extension WebView.Coordinator: WKScriptMessageHandler {
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        guard message.name == "instaDMDiag" else { return }
+        NSLog("%@", "[InstaDM/page] \(message.body)")
+    }
+}
+#endif
 
 // MARK: - WebKit nullability workaround
 //

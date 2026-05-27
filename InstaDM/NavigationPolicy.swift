@@ -95,6 +95,28 @@ enum NavigationPolicy {
         "/direct/new",
     ]
 
+    /// Auth surfaces — login, account recovery, security challenges, and
+    /// Instagram's `/auth_platform/*` login-verification flow (the recaptcha /
+    /// bot-check step that fresh login routes through). On these the SPA guard
+    /// stands down, the navigation policy allows everything, and the cookie
+    /// watcher takes over. Deliberately **not** `/accounts/activity`
+    /// (FollowRequests) or other non-auth `/accounts/*` paths — only
+    /// credential / challenge / verification flows, so the DM-only guard stays
+    /// armed everywhere else.
+    ///
+    /// `/auth_platform` being absent here was the fresh-login bug: once the web
+    /// view committed to `/auth_platform/`, the policy cancelled the follow-up
+    /// `/auth_platform/recaptcha/` navigation (NSURLError -999) and the login
+    /// spinner hung forever. Confirmed via the `[InstaDM/decideAction.authAllow]`
+    /// + `didFailProvisionalLoadForFrame code=-999` trace.
+    static let authSurfacePathPrefixes: [String] =
+        authAccountPathPrefixes + ["/challenge", "/auth_platform"]
+
+    /// True when `path` is a login / account-recovery / challenge surface.
+    static func isAuthSurfacePath(_ path: String) -> Bool {
+        pathMatches(path, anyOf: authSurfacePathPrefixes)
+    }
+
     // MARK: - Source context
 
     /// Information about where a navigation originated. Used to permit

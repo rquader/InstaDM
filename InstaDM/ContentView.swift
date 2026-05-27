@@ -53,9 +53,13 @@ struct ContentView: View {
                 .tabItem { Label("Messages", systemImage: "bubble.left.and.bubble.right.fill") }
                 .tag(Tab.messages)
 
-            WebView(startURL: FollowRequests.url, tracksNotifications: false)
-                .tabItem { Label(FollowRequests.displayName, systemImage: FollowRequests.symbolName) }
-                .tag(Tab.requests)
+            WebView(
+                startURL: FollowRequests.url,
+                allowedPathPrefixes: FollowRequests.allowedPathPrefixes,
+                tracksNotifications: false
+            )
+            .tabItem { Label(FollowRequests.displayName, systemImage: FollowRequests.symbolName) }
+            .tag(Tab.requests)
         }
         .onAppear {
             NotificationManager.shared.setMessagesTabVisible(selectedTab == .messages)
